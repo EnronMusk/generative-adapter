@@ -51,8 +51,8 @@ from .configuration_mistral import MistralConfig
 
 #     _flash_supports_window_size = "window_size" in list(inspect.signature(flash_attn_func).parameters)
 
-from ultragist.modeling_ultragist import Memory
-from ultragist.modeling_utils import optional_grad_ctx, compute_loss, ModelOutput
+# from ultragist.modeling_ultragist import Memory
+# from ultragist.modeling_utils import optional_grad_ctx, compute_loss, ModelOutput
 
 
 logger = logging.get_logger(__name__)

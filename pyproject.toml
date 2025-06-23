@@ -1,0 +1,11 @@
+[project]
+name = "fastlora"
+version = "0.1.0"
+description = ""
+readme = ""
+requires-python = ">=3.10"
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["fastlora*"]

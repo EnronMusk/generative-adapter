@@ -1,77 +1,131 @@
-# Generative Adapter
+# 🚀 Generative Adapter
 
-This repository contains the code accompanying the paper **"Generative Adapter: Contextualizing Language Models in Parameters with A Single Forward Pass"**. The repository demonstrates how to use our Generative Adapter approach to condition large language models with contextual information in a single forward pass by integrating LoRA (Low-Rank Adaptation) weights.
+<div align="center">
 
----
+[![arXiv](https://img.shields.io/badge/arXiv-2411.05877-b31b1b.svg)](https://arxiv.org/abs/2411.05877)
 
-## Repository Structure
+</div>
 
-- **`requirements.txt`**  
-  Lists all the necessary dependencies. **Important:** Make sure to use the following versions for key packages:
-  - `transformers==4.42.4`
-  - `peft==0.11.1`
 
-- **`inference.ipynb`**  
-  A Jupyter Notebook that guides you through the process of:
-  - Loading the pretrained base causal language model.
-  - Creating a FastLora adapter to inject contextual prompts.
-  - Generating conditional text based on a prompt prefix and an input query.
+## ✨ Features
 
----
+- 🔥 **Single Forward Pass**: Adapts to new context efficiently without multiple forward passes or retrieval.
+- 🧠 **Context-Aware Adaptation**: Generates LoRA adapters dynamically based on the input context.
+- 🎯 **Better Knowledge Integration**: Outperforms prompting and fine-tuning for knowledge injection within 8K tokens.
 
-## Setup Environment
+## 🎯 What is Generative Adapter?
 
-1. **Clone the repository:**
+<div align="center">
+  <img src="docs/framework.jpg" alt="Framework Overview" width="600"/>
+</div>
 
-   ```bash
-   git clone https://github.com/your_username/generative-adapter.git
-   cd generative-adapter
-   ```
+Generative Adapter is a method for adapting language models by generating LoRA adapters conditioned on the input context. It is more efficient than prompting and fine-tuning, and allows for stronger integration of new knowledge than continual pretraining within a limited token budget (e.g., 8K tokens). During inference, the generated adapters are merged into the model, enabling behavior similar to fine-tuned models while preserving the flexibility of prompting.
 
-2. **Install Dependencies:**
+Compared to conventional solutions:
 
-   We recommend using a virtual environment. After setting up your environment, run:
+- Like prompting, it uses contextual information during inference, but introduces learnable components.
+- Like fine-tuning, it adapts model behavior, but avoids modifying base model parameters.
+- It supports a broad range of adaptation tasks, including updating factual knowledge, learning new tasks from a few examples, and maintaining long-term conversational memory.
 
-   ```bash
-   pip install -r requirements.txt
-   ```
+## 🚀 Quick Start
 
-   **Note:** Ensure you have the following versions for compatibility:
-   - `python==3.10`
-   - `transformers==4.42.4`
-   - `peft==0.11.1`
+### Installation
 
----
+```bash
+# Or install from source
+git clone https://github.com/your-username/generative-adapter.git
+cd generative-adapter
+pip install -r requirements.txt
+pip install -e .
+```
 
-## Model Inference
+### Basic Usage
 
-1. **Open the Notebook:**
-   - Launch Jupyter Notebook or JupyterLab. Or, if you prefer, open it directly in your favorite IDE that supports notebooks.
+see demonstration in `inference.ipynb`.
 
-2. **Execute the Cells:**  
-   Run the notebook cells sequentially. The code includes:
-   - Loading the base model and tokenizer.
-   - Loading the PEFT configuration and FastLora adapter.
-   - Generating LoRA weights based on the provided prompt prefix.
-   - Generating and printing the final text output.
 
-3. **GPU Requirement:**  
-   The notebook is set up to run on a CUDA-enabled GPU (`device = 'cuda'`). Ensure that your system has the necessary GPU support and that your PyTorch installation is configured to use CUDA.
+## 🛠️ Training
+
+### Downloading Data
+
+You can download the dataset used in our study from [Hugging Face Datasets](https://huggingface.co/datasets/generative-adaptor/generative-adapter-data):
+
+```bash
+git clone https://huggingface.co/datasets/generative-adaptor/generative-adapter-data data
+```
+
+This will save the dataset into a local folder named `data`.
 
 ---
 
-## Citation
+### Pretraining
 
-If you use this code or approach in your research, please consider citing our work:
+We pretrain using a dynamic LoRA generation strategy over 1B tokens from the SlimPajama dataset, which includes a diverse mix of sources: CommonCrawl (52.2%), C4 (26.7%), GitHub (5.2%), Books (4.2%), ArXiv (4.6%), Wikipedia (3.8%), and StackExchange (3.3%).
+
+**Training Setup:**
+* **Model**: Mistral-7B-Instruct-v0.2
+* **Sequence Length**: 8K
+* **Generative Adapter Rank**: 128
+* **Generative Adapter Alpha**: 64
+* **Learning Rate**: 5e-5
+* **Batch Size (Global)**: 8
+* **Training Steps**: 1B tokens
+
+**Training Objective**:
+We implement reconstruction and completion tasks by appending a copy of the input sequence to itself. To train the adapter generator, we split the combined sequence into 1K-token windows. For each window, we generate LoRA adapters based on all previous windows and dynamically merge them into the model to compute the next-token prediction.
+
+
+```bash
+cd scripts/train
+bash pretrain.sh
+```
+
+---
+
+### Instruction Tuning (SFT)
+
+We fine-tune using tasks designed for long-context understanding:
+
+**Datasets:**
+COQA, DROP, NarrativeQA, MS MARCO, BookSum, LongAlpaca, MetaICL, QuAIL, PubMedQA
+
+**SFT Setup:**
+
+* **Base Model**: Pretrained FastLoRA checkpoint
+* **Learning Rate**: 5e-5
+* **Epochs**: 2
+* **Batch Size**: 32
+
+```bash
+cd scripts/train
+bash finetune.sh
+```
+
+---
+
+### Custom Data Preparation
+
+```bash
+# Prepare pretraining data
+cd scripts/data
+bash prepare.sh
+
+# Create instruction tuning data
+ipython instruction-tuning-data-v4.ipynb
+```
+
+
+## 📖 Citation
+
+If you find this work useful, please cite our paper:
 
 ```bibtex
-@misc{chen2024generative,
-      title={Generative Adapter: Contextualizing Language Models in Parameters with A Single Forward Pass}, 
-      author={Tong Chen and Hao Fang and Patrick Xia and Xiaodong Liu and Benjamin Van Durme and Luke Zettlemoyer and Jianfeng Gao and Hao Cheng},
-      year={2024},
-      eprint={2411.05877},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2411.05877}, 
+@inproceedings{
+chen2025generative,
+title={Generative Adapter: Contextualizing Language Models in Parameters with A Single Forward Pass},
+author={Tong Chen and Hao Fang and Patrick Xia and Xiaodong Liu and Benjamin Van Durme and Luke Zettlemoyer and Jianfeng Gao and Hao Cheng},
+booktitle={The Thirteenth International Conference on Learning Representations},
+year={2025},
+url={https://openreview.net/forum?id=bc3sUsS6ck}
 }
 ```

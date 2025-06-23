@@ -1,4 +1,4 @@
-from fastlora.args import ModelArgs
+from .args import ModelArgs
 
 import logging
 logging.basicConfig(

@@ -21,7 +21,6 @@ import json
 import inspect
 import numpy as np
 from functools import partial
-from rouge import Rouge
 from tqdm import tqdm
 from transformers.utils import logging
 
@@ -489,6 +488,7 @@ class Metric:
                 f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
     def rouge(preds, labels, **kwargs):
+        from rouge import Rouge
         rouge = Rouge()
 
         if len(preds) != len(labels):
