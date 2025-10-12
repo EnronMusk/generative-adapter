@@ -27,6 +27,14 @@ class ModelArgs:
         default=None,
         metadata={'help': 'Evaluation json file.'},
     )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={'help': 'Maximum number of training samples to use (for debugging).'},
+    )
+    max_eval_samples: Optional[int] = field(
+        default=None,
+        metadata={'help': 'Maximum number of evaluation samples to use (for debugging).'},
+    )
     
     model_name_or_path: str = field(
         default='meta-llama/Llama-2-7b-chat-hf',
@@ -45,7 +53,7 @@ class ModelArgs:
         metadata={'help': 'Huggingface access token.'}
     )
     attn_impl: Optional[str] = field(
-        default="sdpa",
+        default="flash_attention_2",
         metadata={'help': 'The implementation of attention.'}
     )
 
@@ -214,7 +222,7 @@ class ModelArgs:
     )
     fastlora_param: Optional[List[str]] = field(
         default=None,
-        metadata={'help': 'The introduced parameters for ultragist.'}
+        metadata={'help': 'The introduced parameters for ultragist.', 'nargs': '+'}
     )
     fastlora_arch: Optional[str] = field(
         default=None,
@@ -235,6 +243,66 @@ class ModelArgs:
     fastlora_training_attention_mask: Optional[str] = field(
         default=None,
         metadata={'help': 'The target modules to apply FastLoRA.'}
+    )
+    fastlora_diag_fix: bool = field(
+        default=False,
+        metadata={'help': 'Use diagonal=0 instead of diagonal=-1 for causal merge. Allows segment 0 to use its own hidden states.'}
+    )
+    fastlora_use_mlp: bool = field(
+        default=False,
+        metadata={'help': 'Use MLP architecture (2-layer MLP for query/key projections) instead of simple linear A2/A3.'}
+    )
+    fastlora_normalize_ss: bool = field(
+        default=False,
+        metadata={'help': 'Normalize ss matrix by sqrt(token_count) after key@value multiplication to prevent magnitude explosion.'}
+    )
+    fastlora_add_embeddings: bool = field(
+        default=False,
+        metadata={'help': 'Add learnable module-type embeddings to allow different adaptation patterns for different module types (q_proj, k_proj, etc.).'}
+    )
+    fastlora_add_layer_embeddings: bool = field(
+        default=False,
+        metadata={'help': 'Add learnable layer-index embeddings to allow different adaptation patterns for different depths (early vs late layers).'}
+    )
+    
+    # GELU activation flags
+    fastlora_use_activations_a1: bool = field(
+        default=False,
+        metadata={'help': 'Add GELU activation after A1 projection for more expressive query representations.'}
+    )
+    fastlora_use_activations_a2_a3: bool = field(
+        default=False,
+        metadata={'help': 'Add GELU activations after A2 and A3 projections for more expressiveness in key/value generation.'}
+    )
+    fastlora_activation_type: str = field(
+        default="gelu",
+        metadata={'help': 'Type of activation to use: {gelu, silu, relu, swish}'}
+    )
+    fastlora_use_activations_after_ss: bool = field(
+        default=False,
+        metadata={'help': 'Add activation after the ss matrix multiplication (query @ ss) before applying B.'}
+    )
+    
+    # Deep Context Refiner (Transformer-based hypernetwork) arguments
+    fastlora_use_deep_refiner: bool = field(
+        default=False,
+        metadata={'help': 'Use Deep Context Refiner architecture (stacked transformer blocks for context processing).'}
+    )
+    fastlora_refiner_layers: Optional[int] = field(
+        default=2,
+        metadata={'help': 'Number of layers in the Deep Context Refiner stack.'}
+    )
+    fastlora_refiner_ffn_size: Optional[int] = field(
+        default=None,
+        metadata={'help': 'FFN hidden size in Deep Context Refiner blocks. Defaults to 4 * fastlora_inter_size.'}
+    )
+    fastlora_parallelize: bool = field(
+        default=False,
+        metadata={'help': 'Parallelize FastLoRA generator computations across all modules using batched operations for better GPU utilization.'}
+    )
+    fastlora_use_last: bool = field(
+        default=False,
+        metadata={'help': 'Share FastLoRA adapters across layers, using only the last layer\'s adapters with layer embeddings for differentiation. Automatically enables layer embeddings.'}
     )
 
     max_new_tokens: Optional[int] = field(

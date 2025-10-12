@@ -125,10 +125,16 @@ class Data:
         import torch.nn.functional as F
 
         outputs = {'input_ids': [], 'attention_mask': [], "labels": [], "length": [], "index": []}
+        
+        # In eval mode, also store raw text for comparison
+        if eval_mode:
+            outputs['ground_truth_text'] = []
+            outputs['query_text'] = []
+            outputs['context_text'] = []
 
         for i, source in enumerate(data['conversations']):
             if len(source) == 0:
-                logger.warning(f"Empty conversation found in {data['id'][i]}")
+                logger.warning(f"Empty conversation found in {indices[i] if indices and i < len(indices) else i}")
                 continue
 
             if source[0]["role"] != 'user':
@@ -137,19 +143,24 @@ class Data:
 
             # NOTE: in evaluation, we only use the first turn in the conversation
             if eval_mode:
-                # a string (the expected output from the assistant)
-                if len(source) > 1:
-                    labels = source[1]['content']
+                # Check if ground truth is in separate 'labels' field or in conversations
+                if 'labels' in data and i < len(data['labels']):
+                    # Ground truth is in separate 'labels' field (our format)
+                    ground_truth_text = data['labels'][i]
+                elif len(source) > 1:
+                    # Ground truth is in conversations[1] (standard format)
+                    ground_truth_text = source[1]['content']
                 else:
-                    labels = None
+                    ground_truth_text = ""
+                query_text = source[0]['content']  # Save the query
                 source = source[:1]
 
             encoded = apply_chat_template(
                 chat_template, 
                 source, 
                 tokenizer=tokenizer, 
-                # only return labels in evaluation mode
-                return_labels=not eval_mode,
+                # ALWAYS return labels for loss computation (both training and eval)
+                return_labels=True, # FIXME: madei t always true
                 add_generation_prompt=eval_mode, 
             ).encoded
             token_ids = torch.tensor(encoded["input_ids"]).reshape(1, 1, -1)
@@ -229,6 +240,12 @@ class Data:
             outputs['labels'].append(labels)
             outputs['length'].append(token_ids.shape[-1])
             outputs['index'].append(indices[i])
+            
+            # Store raw text in eval mode
+            if eval_mode:
+                outputs['ground_truth_text'].append(ground_truth_text)
+                outputs['query_text'].append(query_text)
+                outputs['context_text'].append(data.get("context", [""])[i] if "context" in data else "")
 
             # # skip data that not fall in between min_length and max_length
             # if min_length is not None and len(encoded["input_ids"]) < min_length:
@@ -249,7 +266,7 @@ class Data:
         return outputs
 
     @staticmethod
-    def prepare_train_data(data_files=None, tokenizer=None, max_length=4096, min_length=512, window_size=1024, chat_template="vicuna", enable_reconstruct=False, seed=42, cache_dir=None, load_from_cache_file=None):
+    def prepare_train_data(data_files=None, tokenizer=None, max_length=4096, min_length=512, window_size=1024, chat_template="vicuna", enable_reconstruct=False, seed=42, cache_dir=None, load_from_cache_file=None, max_train_samples=None):
         if data_files is None:
             return None
 
@@ -332,6 +349,11 @@ class Data:
             train_datasets.append(dataset)
 
         dataset = datasets.concatenate_datasets(train_datasets)
+        
+        # Truncate to max_train_samples if specified
+        if max_train_samples is not None and len(dataset) > max_train_samples:
+            logger.info(f"Truncating dataset from {len(dataset)} to {max_train_samples} samples")
+            dataset = dataset.select(range(max_train_samples))
 
         return dataset
 

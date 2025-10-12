@@ -102,6 +102,18 @@ def apply_chat_template(template, messages, system_message=None, tokenizer:PreTr
             "begin_of_text_len": 1,
             "role_sep_left_offset": -4,
         },
+        'qwen2.5': {
+            "turn_sep": "<|im_end|>\n",
+            "role_sep": "<|im_end|>\n",
+            "begin_of_text_len": 0,
+            "role_sep_left_offset": 0,
+        },
+        'qwen3': {
+            "turn_sep": "<|im_end|>\n",
+            "role_sep": "<|im_end|>\n",
+            "begin_of_text_len": 0,
+            "role_sep_left_offset": 0,
+        },
     }[template]
 
     role_map = {
@@ -115,6 +127,11 @@ def apply_chat_template(template, messages, system_message=None, tokenizer:PreTr
         content = message['content']
         if prev_role == role:
             raise ValueError(f"Current role (idx={i}) {role} and previous role {messages[i-1]['role']} are the same!")
+        
+        # For Qwen3, wrap assistant responses with <think> tags to train it to answer directly
+        if template == "qwen3" and message['role'] == 'assistant' and not add_generation_prompt:
+            content = f"<think>\n\n</think>\n\n{content}"
+        
         conversation_template.append_message(role, content)
         prev_role = role
     
@@ -137,48 +154,120 @@ def apply_chat_template(template, messages, system_message=None, tokenizer:PreTr
             turn_sep_len = len(tokenizer.encode(turn_sep, add_special_tokens=False))
 
             # transform to array for fast value assignment
-            labels = deepcopy(encoded['input_ids'])
+            # Handle both list and tensor input_ids
+            if hasattr(encoded['input_ids'], 'tolist'):
+                # It's a tensor, convert to list first
+                input_ids_list = encoded['input_ids'].tolist()
+                if isinstance(input_ids_list[0], list):
+                    # Batched, take first batch
+                    input_ids_list = input_ids_list[0]
+            else:
+                input_ids_list = encoded['input_ids']
+            
+            labels = deepcopy(input_ids_list)
             labels = np.array(labels)
             total_len = len(labels)
 
-            turns = conversation.split(turn_sep)
-
-            cur_len = 0
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
+            # Special handling for ChatML-style templates (qwen2.5, qwen3)
+            # where turn_sep == role_sep == "<|im_end|>\n"
+            if template in ['qwen2.5', 'qwen3']:
+                # For ChatML, mask everything except assistant responses
+                # Structure: <|im_start|>assistant\ncontent<|im_end|>\n
+                labels[:] = -100  # Mask everything by default
                 
-                turn_len = len(tokenizer(turn, add_special_tokens=False).input_ids)
+                # The assistant marker tokens
+                assistant_start_token = tokenizer.encode("<|im_start|>assistant", add_special_tokens=False)
+                newline_token = tokenizer.encode("\n", add_special_tokens=False)
+                end_token = tokenizer.encode("<|im_end|>", add_special_tokens=False)
+                
+                # Find assistant responses in the token sequence
+                i = 0
+                while i < total_len:
+                    # Look for <|im_start|>assistant\n pattern
+                    match_assistant = True
+                    if i + len(assistant_start_token) + len(newline_token) < total_len:
+                        for j, tok in enumerate(assistant_start_token):
+                            if input_ids_list[i + j] != tok:
+                                match_assistant = False
+                                break
+                        if match_assistant:
+                            for j, tok in enumerate(newline_token):
+                                if input_ids_list[i + len(assistant_start_token) + j] != tok:
+                                    match_assistant = False
+                                    break
+                    else:
+                        match_assistant = False
+                    
+                    if match_assistant:
+                        # Found assistant marker, skip past it
+                        content_start = i + len(assistant_start_token) + len(newline_token)
+                        
+                        # Find the end marker
+                        content_end = content_start
+                        while content_end < total_len:
+                            match_end = True
+                            if content_end + len(end_token) <= total_len:
+                                for j, tok in enumerate(end_token):
+                                    if input_ids_list[content_end + j] != tok:
+                                        match_end = False
+                                        break
+                                if match_end:
+                                    break
+                            content_end += 1
+                        
+                        # Unmask the assistant content (between markers) AND the end token
+                        # This ensures the model learns to generate <|im_end|> to stop
+                        for j in range(content_start, content_end + len(end_token)):
+                            if j < total_len:
+                                labels[j] = input_ids_list[j]
+                        
+                        i = content_end + len(end_token)
+                    else:
+                        i += 1
+            
+            else:
+                # Original logic for other templates (mistral, llama, etc.)
+                turns = conversation.split(turn_sep)
 
-                parts = turn.split(role_sep)
+                cur_len = 0
+                for i, turn in enumerate(turns):
+                    if turn == "":
+                        break
+                    
+                    turn_len = len(tokenizer(turn, add_special_tokens=False).input_ids)
 
-                if len(parts) != 2:
-                    break
+                    parts = turn.split(role_sep)
 
-                user_message, assistant_message = parts
+                    if len(parts) != 2:
+                        break
 
-                user_message += role_sep
-                instruction_len = len(tokenizer(user_message, add_special_tokens=False).input_ids)
+                    user_message, assistant_message = parts
 
-                # for bos tokens
-                if i == 0:
-                    turn_len += begin_of_text_len
-                    instruction_len += begin_of_text_len
+                    user_message += role_sep
+                    instruction_len = len(tokenizer(user_message, add_special_tokens=False).input_ids)
 
-                # Ignore the user instructions
-                labels[max(cur_len + role_sep_left_offset, 0): cur_len + instruction_len] = -100
+                    # for bos tokens
+                    if i == 0:
+                        turn_len += begin_of_text_len
+                        instruction_len += begin_of_text_len
 
-                cur_len = cur_len + turn_len + turn_sep_len
+                    # Ignore the user instructions
+                    labels[max(cur_len + role_sep_left_offset, 0): cur_len + instruction_len] = -100
 
-                if cur_len > total_len:
-                    break
+                    cur_len = cur_len + turn_len + turn_sep_len
 
-            labels[max(cur_len + role_sep_left_offset, 0):] = -100
+                    if cur_len > total_len:
+                        break
+
+                labels[max(cur_len + role_sep_left_offset, 0):] = -100
 
             encoded['labels'] = labels.tolist()
 
             # sanity check
-            for id_, label_ in zip(encoded['input_ids'], encoded['labels']):
+            # Handle both list and tensor for assertion
+            check_input_ids = input_ids_list if 'input_ids_list' in locals() else encoded['input_ids']
+            check_labels = labels.tolist()
+            for id_, label_ in zip(check_input_ids, check_labels):
                 assert id_ == label_ or label_ == -100, f"Found mismatch input_ids and labels!"
 
     else:
@@ -1579,6 +1668,44 @@ register_conv_template(
         name="qwen-7b-chat",
         system_template="<|im_start|>system\n{system_message}",
         system_message="You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_token_ids=[
+            151643,
+            151644,
+            151645,
+        ],  # "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+        stop_str="<|endoftext|>",
+    )
+)
+
+# Qwen2.5 chat template
+# source: https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct
+register_conv_template(
+    Conversation(
+        name="qwen2.5",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep_style=SeparatorStyle.CHATML,
+        sep="<|im_end|>",
+        stop_token_ids=[
+            151643,
+            151644,
+            151645,
+        ],  # "<|endoftext|>", "<|im_start|>", "<|im_end|>"
+        stop_str="<|endoftext|>",
+    )
+)
+
+# Qwen3 chat template
+# source: https://huggingface.co/Qwen/Qwen3-0.6B
+register_conv_template(
+    Conversation(
+        name="qwen3",
+        system_template="<|im_start|>system\n{system_message}",
+        system_message="You are Qwen, created by Alibaba Cloud. You are a helpful assistant.",
         roles=("<|im_start|>user", "<|im_start|>assistant"),
         sep_style=SeparatorStyle.CHATML,
         sep="<|im_end|>",
