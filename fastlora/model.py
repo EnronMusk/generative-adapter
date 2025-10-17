@@ -90,14 +90,14 @@ class FastLoraLinear(nn.Module, LoraLayer):
     """
     FastLoRA: Context-dependent LoRA adaptation.
     
-    Two architecture modes:
+    Architecture modes:
     
     1. **Linear Architecture** (default, fastlora_use_mlp=False):
        - A1: x [D_in] -> [fastlora_inter_size]
        - A2: H [hidden_size] -> [fastlora_inter_size]  (linear)
-       - A3: H [hidden_size] -> [fastlora_r]  (linear)
-       - B: [fastlora_r] -> [D_out]
-       - ss = A2(H)^T @ A3(H): [B, S, fastlora_inter_size, fastlora_r]
+       - A3: H [hidden_size] -> [fastlora_r OR fastlora_inter_size]  (linear, depends on square_ss)
+       - B: [fastlora_r OR fastlora_inter_size] -> [D_out]
+       - ss = A2(H)^T @ A3(H): [B, S, fastlora_inter_size, fastlora_r OR fastlora_inter_size]
        - output = B(A1(x) @ ss)
     
     2. **MLP Architecture** (fastlora_use_mlp=True):
@@ -108,7 +108,12 @@ class FastLoraLinear(nn.Module, LoraLayer):
        - ss = A2(H)^T @ A3(H): [B, S, fastlora_inter_size, fastlora_inter_size]
        - output = B(A1(x) @ ss)
     
-    The MLP architecture provides more expressiveness for encoding context at the cost of more parameters.
+    **Square SS Matrix** (fastlora_use_square_ss=True):
+    - Forces A3 to output fastlora_inter_size instead of fastlora_r in linear architecture
+    - Results in square ss matrix [inter_size, inter_size] for richer interactions
+    - Independent of MLP flag - can be used with both linear and MLP architectures
+    
+    The MLP architecture and square ss option provide more expressiveness for encoding context at the cost of more parameters.
     
     **Normalization** (fastlora_normalize_ss=True):
     - Applies 1/sqrt(token_count) scaling to ss after key@value multiplication
@@ -164,6 +169,9 @@ class FastLoraLinear(nn.Module, LoraLayer):
         fastlora_use_activations_a2_a3: bool = False,
         fastlora_activation_type: str = "gelu",
         fastlora_use_activations_after_ss: bool = False,
+        fastlora_use_activations_ss_softmax: bool = False,
+        fastlora_use_activations_ss_tanh: bool = False,
+        fastlora_use_square_ss: bool = False,
         fastlora_use_last: bool = False,
         module_type: str = "unknown",
         layer_idx: int = -1,
@@ -177,7 +185,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
         )
         self.other_param_names = (
             "fastlora_r", "fastlora_max_rank", "fastlora_inter_size", "fastlora_alpha",
-            "fastlora_dropout", "fastlora_arch", "fastlora_norm", "fastlora_init", "fastlora_diag_fix", "fastlora_use_mlp", "fastlora_normalize_ss", "fastlora_add_embeddings", "fastlora_add_layer_embeddings", "fastlora_use_deep_refiner", "fastlora_refiner_layers", "fastlora_refiner_ffn_size", "fastlora_use_activations_a1", "fastlora_use_activations_a2_a3", "fastlora_activation_type", "fastlora_use_activations_after_ss", "fastlora_use_last"
+            "fastlora_dropout", "fastlora_arch", "fastlora_norm", "fastlora_init", "fastlora_diag_fix", "fastlora_use_mlp", "fastlora_normalize_ss", "fastlora_add_embeddings", "fastlora_add_layer_embeddings", "fastlora_use_deep_refiner", "fastlora_refiner_layers", "fastlora_refiner_ffn_size", "fastlora_use_activations_a1", "fastlora_use_activations_a2_a3", "fastlora_activation_type", "fastlora_use_activations_after_ss", "fastlora_use_activations_ss_softmax", "fastlora_use_activations_ss_tanh", "fastlora_use_square_ss", "fastlora_use_last"
         )
 
         # self.parent = parent
@@ -202,6 +210,9 @@ class FastLoraLinear(nn.Module, LoraLayer):
         print("USING ACTIVATIONS A2/A3 {}".format(fastlora_use_activations_a2_a3))
         print("USING ACTIVATION TYPE {}".format(fastlora_activation_type))
         print("USING ACTIVATIONS AFTER SS {}".format(fastlora_use_activations_after_ss))
+        print("USING SS SOFTMAX ACTIVATION {}".format(fastlora_use_activations_ss_softmax))
+        print("USING SS TANH ACTIVATION {}".format(fastlora_use_activations_ss_tanh))
+        print("USING SQUARE SS MATRIX {}".format(fastlora_use_square_ss))
         print("USING USE_LAST {}".format(fastlora_use_last))
         print("USING MODULE TYPE {}".format(module_type))
         print("USING LAYER IDX {}".format(layer_idx))
@@ -229,6 +240,9 @@ class FastLoraLinear(nn.Module, LoraLayer):
             self.fastlora_use_activations_a2_a3 = fastlora_use_activations_a2_a3
             self.fastlora_activation_type = fastlora_activation_type
             self.fastlora_use_activations_after_ss = fastlora_use_activations_after_ss
+            self.fastlora_use_activations_ss_softmax = fastlora_use_activations_ss_softmax
+            self.fastlora_use_activations_ss_tanh = fastlora_use_activations_ss_tanh
+            self.fastlora_use_square_ss = fastlora_use_square_ss
             self.fastlora_use_last = fastlora_use_last
             self.module_type = module_type
             self.layer_idx = layer_idx
@@ -284,8 +298,19 @@ class FastLoraLinear(nn.Module, LoraLayer):
             else:
                 # Original linear architecture
                 self.fastlora_A2 = nn.Linear(a2_a3_input_dim, self.fastlora_inter_size, bias=False, dtype=dtype)
-                self.fastlora_A3 = nn.Linear(a2_a3_input_dim, self.fastlora_r, bias=False, dtype=dtype)
-                self.fastlora_B = nn.Linear(self.fastlora_r, self.out_features, bias=False, dtype=dtype)
+                
+                # Determine A3 output dimension and B input dimension based on square_ss flag
+                if self.fastlora_use_square_ss:
+                    # Square ss matrix: A3 outputs inter_size for [inter_size, inter_size] ss matrix
+                    a3_output_dim = self.fastlora_inter_size
+                    b_input_dim = self.fastlora_inter_size
+                else:
+                    # Rectangular ss matrix: A3 outputs fastlora_r for [inter_size, r] ss matrix  
+                    a3_output_dim = self.fastlora_r
+                    b_input_dim = self.fastlora_r
+                    
+                self.fastlora_A3 = nn.Linear(a2_a3_input_dim, a3_output_dim, bias=False, dtype=dtype)
+                self.fastlora_B = nn.Linear(b_input_dim, self.out_features, bias=False, dtype=dtype)
             
             if self.fastlora_norm == "attention":
                 self.fastlora_AQ = nn.Linear(self.hidden_size, self.fastlora_max_rank, bias=False, dtype=dtype)
@@ -298,8 +323,13 @@ class FastLoraLinear(nn.Module, LoraLayer):
                                     'gate_proj', 'up_proj', 'down_proj', 'unknown']
                 self.module_type_to_id = {name: i for i, name in enumerate(self.module_types)}
                 # Embedding outputs shape compatible with ss [R1, R2]
-                # For linear arch: [inter_size, r], for MLP: [inter_size, inter_size]
-                emb_dim2 = self.fastlora_inter_size if self.fastlora_use_mlp else self.fastlora_r
+                # Determine ss matrix dimensions based on architecture
+                if self.fastlora_use_mlp or self.fastlora_use_square_ss:
+                    # MLP architecture OR square ss: [inter_size, inter_size]
+                    emb_dim2 = self.fastlora_inter_size
+                else:
+                    # Linear architecture with rectangular ss: [inter_size, r]
+                    emb_dim2 = self.fastlora_r
                 self.fastlora_module_embedding = nn.Parameter(
                     torch.zeros(len(self.module_types), self.fastlora_inter_size, emb_dim2, dtype=dtype)
                 )
@@ -308,8 +338,13 @@ class FastLoraLinear(nn.Module, LoraLayer):
             # Layer index embeddings for depth-dependent adaptation patterns
             if self.fastlora_add_layer_embeddings:
                 # Embedding for each layer (0 to num_layers-1)
-                # For linear arch: [inter_size, r], for MLP: [inter_size, inter_size]
-                emb_dim2 = self.fastlora_inter_size if self.fastlora_use_mlp else self.fastlora_r
+                # Determine ss matrix dimensions based on architecture
+                if self.fastlora_use_mlp or self.fastlora_use_square_ss:
+                    # MLP architecture OR square ss: [inter_size, inter_size]
+                    emb_dim2 = self.fastlora_inter_size
+                else:
+                    # Linear architecture with rectangular ss: [inter_size, r]
+                    emb_dim2 = self.fastlora_r
                 self.fastlora_layer_embedding = nn.Parameter(
                     torch.zeros(self.num_layers, self.fastlora_inter_size, emb_dim2, dtype=dtype)
                 )
@@ -448,22 +483,28 @@ class FastLoraLinear(nn.Module, LoraLayer):
 
         # during training if S contains similar singular values, the gradient is not stable. if that happens, we just drop the adaptor and return zero.
         if self.training and reset:
-            # Compute the minimum separation between consecutive singular values
-            eps = 1e-6
-            min_separation = torch.minimum((S[..., :-1] - S[..., 1:]) / (S[..., 0].unsqueeze(-1) + eps), (S[..., :-1] - S[..., 1:])).min(dim=-1).values
+            try:
+                # Compute the minimum separation between consecutive singular values
+                eps = 1e-6
+                min_separation = torch.minimum((S[..., :-1] - S[..., 1:]) / (S[..., 0].unsqueeze(-1) + eps), (S[..., :-1] - S[..., 1:])).min(dim=-1).values
 
-            # Create a boolean mask where the minimum separation is less than the threshold
-            reset_mask = min_separation < reset_threshold
+                # Create a boolean mask where the minimum separation is less than the threshold
+                reset_mask = min_separation < reset_threshold
 
-            # Expand the mask dimensions for broadcasting
-            reset_mask = reset_mask[..., None, None]
+                # Expand the mask dimensions for broadcasting
+                reset_mask = reset_mask[..., None, None]
 
-            # Reset M_norm to zero where the mask is True
-            M_norm = M_norm.masked_fill(reset_mask, 0.0)
+                # Reset M_norm to zero where the mask is True
+                M_norm = M_norm.masked_fill(reset_mask, 0.0)
 
-            if reset_mask.any():
-                print(f"[WARNING] Singular values are too close, resetting the adaptor to zero, min_separation: {min_separation}")
-
+                # if reset_mask.any():
+                #     print(f"[WARNING] Singular values are too close, resetting the adaptor to zero, min_separation: {min_separation}")
+            except (IndexError, RuntimeError):
+                # Handle rank-1 case where there are no consecutive pairs to compare
+                # With only 1 singular value, there's no "too close" problem
+                
+                
+                return M_norm.to(input_dtpye)
         return M_norm.to(input_dtpye)
 
     def _svd_norm_fixed(self, M):
@@ -498,8 +539,8 @@ class FastLoraLinear(nn.Module, LoraLayer):
             # Create a boolean mask where the minimum separation is less than the threshold
             reset_mask = min_separation < 1e-7
 
-            if reset_mask.any():
-                print(f"[WARNING] Singular values are too close, resetting the adaptor to zero, min_separation: {min_separation}")
+            # if reset_mask.any():
+            #     print(f"[WARNING] Singular values are too close, resetting the adaptor to zero, min_separation: {min_separation}")
 
         return M_result.to(input_dtpye)
 
@@ -719,6 +760,28 @@ class FastLoraLinear(nn.Module, LoraLayer):
             raise ValueError(f"Unknown fastlora_norm: {self.fastlora_norm}")
         return ss
 
+    def _apply_ss_activations(self, ss):
+        """
+        Apply specific activation functions to the ss matrix for stability.
+        
+        Args:
+            ss: The ss matrix with shape [B, S, R1, R2]
+            
+        Returns:
+            Activated ss matrix with same shape
+        """
+        if self.fastlora_use_activations_ss_softmax:
+            # Apply softmax along the R2 dimension (value dimension) for each R1 dimension
+            # This is similar to attention weights normalization
+            ss = F.softmax(ss, dim=-1)  # Softmax over last dimension (R2)
+            
+        elif self.fastlora_use_activations_ss_tanh:
+            # Apply tanh for bounded values between -1 and 1
+            # This prevents extreme activations and provides stability
+            ss = torch.tanh(ss)
+            
+        return ss
+
 
     def _kv_mapping_matrix(self, hidden_states_norm, attention_mask, outer_product=None, merge_target_size=None, merge_is_caual=False):
         assert merge_target_size is not None, "merge_target_size is required for post-norm"
@@ -771,6 +834,9 @@ class FastLoraLinear(nn.Module, LoraLayer):
             if self.fastlora_normalize_ss or self.fastlora_norm == "svd_y":
                 tokens_count = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)    # B, S2, 1, 1
                 ss = ss / torch.sqrt(tokens_count.clamp(min=1))  # B, S2, R1, R2
+
+            # Apply ss activations for stability (softmax or tanh)
+            ss = self._apply_ss_activations(ss)
 
             if self.fastlora_merge.startswith("pre-norm-"):
                 ss = ss.unsqueeze(1).expand(-1, merge_target_size, -1, -1, -1)    # B, S1, S2, R1, R2
@@ -1032,6 +1098,14 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 tokens_count = tokens_count.unsqueeze(1)  # [B, 1, S, 1, 1]
                 ss_all_layers = ss_all_layers / torch.sqrt(tokens_count.clamp(min=1))  # [B, num_layers, S, R1, R2]
 
+            # Step 6.5: Apply ss activations for stability (softmax or tanh) to all layers in parallel
+            if self.fastlora_use_activations_ss_softmax or self.fastlora_use_activations_ss_tanh:
+                # Apply activations to each layer's ss matrix
+                for layer_i in range(num_layers):
+                    ss_layer = ss_all_layers[:, layer_i, :, :, :]  # [B, S, R1, R2]
+                    ss_layer = self._apply_ss_activations(ss_layer)
+                    ss_all_layers[:, layer_i, :, :, :] = ss_layer
+
             # Step 7: Apply merge and normalization operations
             if self.fastlora_merge.startswith("pre-norm-"):
                 # Note: This part may need adaptation for parallel processing depending on merge requirements
@@ -1092,13 +1166,24 @@ class FastLoraLinear(nn.Module, LoraLayer):
         B, S = self.args["batch_size"], self.args["num_segments"]
         
         # Handle use_last mode: expand batch dimension to include all layers
-        if self.fastlora_use_last and hasattr(self.args, "all_layers_mode") and self.args.get("all_layers_mode", False):
-            # In use_last mode, x has shape [B*num_layers, S, L, D_in]
+        used_multi_layer_path = False
+        if self.fastlora_use_last and "all_layers_mode" in self.args and self.args.get("all_layers_mode", False):
+            # In use_last mode, x should have shape [B*num_layers*S, L, D_in]
             # We need to reshape it to [B, num_layers, S, L, D_in]
             num_layers = self.num_layers
-            x = x.reshape((B, num_layers, S) + x.shape[1:])
-            result = self.base_layer(x.reshape((B * num_layers * S,) + x.shape[3:]))
-            result = result.reshape((B, num_layers, S) + result.shape[1:])
+            expected_size = B * num_layers * S
+            
+            # Safety check: verify tensor has expected size for multi-layer reshape
+            if x.shape[0] == expected_size:
+                x = x.reshape((B, num_layers, S) + x.shape[1:])
+                result = self.base_layer(x.reshape((B * num_layers * S,) + x.shape[3:]))
+                result = result.reshape((B, num_layers, S) + result.shape[1:])
+                used_multi_layer_path = True
+            else:
+                # Fallback: tensor doesn't have multi-layer structure, use standard mode
+                # This can happen during generation where input is just [B*S, L, D_in]
+                x = x.reshape((B, S) + x.shape[1:])
+                result = self.base_layer(x)
         else:
             # Standard mode
             x = x.reshape((B, S) + x.shape[1:])
@@ -1115,7 +1200,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 lora_a = self.args["lora_a"]    # B x R x Di
                 lora_b = self.args["lora_b"]    # B x Do x R
                 
-                if self.fastlora_use_last and hasattr(self.args, "all_layers_mode") and self.args.get("all_layers_mode", False):
+                if self.fastlora_use_last and "all_layers_mode" in self.args and self.args.get("all_layers_mode", False):
                     # For use_last mode, expand lora weights to all layers
                     # x.shape: B x num_layers x S x L x Di
                     lora_a = lora_a.unsqueeze(1).expand(-1, self.num_layers, -1, -1)  # B x num_layers x R x Di
@@ -1135,26 +1220,26 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 hidden_states = self.args["hidden_states"]    # B x S x L x D (or for use_last: B x num_layers x S x L x D)
                 attention_mask = self.args["attention_mask"]    # B x S x L (or for use_last: B x num_layers x S x L)
                 
-                if self.fastlora_use_last and hasattr(self.args, "all_layers_mode") and self.args.get("all_layers_mode", False):
-                    # For use_last mode, use the parallel transform for efficiency
-                    # Use only the last layer's hidden states for all layers
-                    last_hidden_states = hidden_states[:, -1, :, :, :]  # B x S x L x D
-                    last_attention_mask = attention_mask[:, -1, :, :]   # B x S x L
-                    
-                    print(f"USING PARALLEL TRANSFORM: Processing {self.num_layers} layers simultaneously for module {self.module_type}")
-                    
-                    # Call parallel transform
-                    x = self._x_transform_parallel(
-                        x,  # B x num_layers x S x L x Di
-                        last_hidden_states,  # B x S x L x D  
-                        last_attention_mask,   # B x S x L
-                        mode=mode
-                    )  # B x num_layers x S x L x Do
-                    result = result + self.fastlora_scaling * x  # B x num_layers x S x L x Do
+                if self.fastlora_use_last and "use_last_hidden" in self.args and self.args.get("use_last_hidden", False):
+                    # For use_last mode with shared adapter from first layer
+                    # Use the last layer's hidden states for all adapters, but each keeps its own layer_idx
+                    # print(f"USING USE_LAST MODE: Module {self.module_type} layer {self.layer_idx} - hidden_states shape: {hidden_states.shape}")
+                    x = self._x_transform(x, hidden_states, attention_mask, mode=mode)  # B x S x L x Do
+                    result = result + self.fastlora_scaling * x  # B x S x L x Do
                 elif self.fastlora_use_last:
                     # Simplified use_last mode - use current hidden states but with shared adapter
                     # print(f"USING USE_LAST MODE: Shared adapter for module {self.module_type} layer {self.layer_idx}")
-                    x = self._x_transform(x, hidden_states, attention_mask, mode=mode)  # B x S x L x Do
+                    # If hidden_states is 5D (from states mode with use_last), extract the last layer
+                    if hidden_states.dim() == 5:
+                        # In states mode with use_last, hidden_states is [B, num_layers, S, L, D]
+                        # Use the last layer's hidden states
+                        hidden_states_to_use = hidden_states[:, -1, :, :, :]  # B x S x L x D
+                        attention_mask_to_use = attention_mask[:, -1, :, :]  # B x S x L
+                    else:
+                        # Standard 4D case
+                        hidden_states_to_use = hidden_states
+                        attention_mask_to_use = attention_mask
+                    x = self._x_transform(x, hidden_states_to_use, attention_mask_to_use, mode=mode)  # B x S x L x Do
                     result = result + self.fastlora_scaling * x  # B x S x L x Do
                 else:
                     # Standard mode
@@ -1166,7 +1251,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 raise ValueError(f"Unknown mode: {mode}")
 
         # Reshape back to original format
-        if self.fastlora_use_last and hasattr(self.args, "all_layers_mode") and self.args.get("all_layers_mode", False):
+        if used_multi_layer_path:
             result = result.reshape((B * self.num_layers * S,) + result.shape[3:])
         else:
             result = result.reshape((B * S,) + result.shape[2:])
@@ -1265,6 +1350,7 @@ class FastLoraModel(LoraModel):
         if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last:
             fastlora_config.fastlora_add_layer_embeddings = True
             print("USING USE_LAST: Automatically enabled layer embeddings")
+            print(f"USING USE_LAST: Layer embeddings now set to {fastlora_config.fastlora_add_layer_embeddings}")
 
         layer_names = [name for name, _ in model.named_modules() if re.match(r"^(?:model\.)*layers\.\d+$", name)]
         for layer_name in layer_names:
@@ -1272,8 +1358,8 @@ class FastLoraModel(LoraModel):
             new_layer_module = FastLoraDecoderLayer(layer_module)
             self._replace_module(parent, target_name, new_layer_module, layer_module)
 
-        # Store mapping of module types to their last layer adapters for use_last mode
-        self.last_layer_adapters = {} if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last else None
+        # Store mapping of module types to their first layer adapters for use_last mode
+        self.first_layer_adapters = {} if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last else None
 
         super().__init__(model, config, adapter_name)
 
@@ -1316,25 +1402,7 @@ class FastLoraModel(LoraModel):
             except (ValueError, IndexError):
                 layer_idx = -1
 
-        # Handle use_last mode: only create adapters for the last layer
-        if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last:
-            num_layers = self.model.config.num_hidden_layers
-            last_layer_idx = num_layers - 1
-            
-            if layer_idx != last_layer_idx:
-                # For non-last layers, don't create adapters, just replace with a reference to the last layer's adapter
-                if module_type in self.last_layer_adapters:
-                    # Use the existing adapter from the last layer
-                    new_module = self.last_layer_adapters[module_type]
-                    self._replace_module(parent, target_name, new_module, target)
-                    return
-                else:
-                    # Skip creating adapter for non-last layers if last layer adapter doesn't exist yet
-                    return
-            else:
-                # This is the last layer, create the adapter and store it for sharing
-                print(f"USING USE_LAST: Creating shared adapter for module type '{module_type}' in last layer {layer_idx}")
-        
+        # Prepare kwargs for module creation (needed for both normal and shared creation)
         kwargs = {
             # "parent": parent,
             # "in_features": target.in_features,
@@ -1365,6 +1433,9 @@ class FastLoraModel(LoraModel):
             "fastlora_use_activations_a2_a3": fastlora_config.fastlora_use_activations_a2_a3,
             "fastlora_activation_type": fastlora_config.fastlora_activation_type,
             "fastlora_use_activations_after_ss": fastlora_config.fastlora_use_activations_after_ss,
+            "fastlora_use_activations_ss_softmax": fastlora_config.fastlora_use_activations_ss_softmax,
+            "fastlora_use_activations_ss_tanh": fastlora_config.fastlora_use_activations_ss_tanh,
+            "fastlora_use_square_ss": fastlora_config.fastlora_use_square_ss,
             "module_type": module_type,
             "layer_idx": layer_idx,
             "num_layers": self.model.config.num_hidden_layers,
@@ -1373,6 +1444,34 @@ class FastLoraModel(LoraModel):
         # Add use_last flag to the module
         if hasattr(fastlora_config, 'fastlora_use_last'):
             kwargs["fastlora_use_last"] = fastlora_config.fastlora_use_last
+
+        # Handle use_last mode: only create adapters for the first layer
+        if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last:
+            num_layers = self.model.config.num_hidden_layers
+            first_layer_idx = 0
+            
+            if layer_idx != first_layer_idx:
+                # For non-first layers, create separate instances that share parameters with the first layer
+                if module_type in self.first_layer_adapters:
+                    # Create a new module instance but share parameters with the first layer's adapter
+                    first_layer_module = self.first_layer_adapters[module_type]
+                    
+                    # Create new instance with correct layer_idx and base module
+                    kwargs_shared = kwargs.copy()
+                    kwargs_shared["layer_idx"] = layer_idx  # Use correct layer index
+                    new_module = self._create_new_module(fastlora_config, adapter_name, target, **kwargs_shared)
+                    
+                    # Share the adapter parameters from the first layer
+                    self._share_adapter_parameters(new_module, first_layer_module)
+                    
+                    self._replace_module(parent, target_name, new_module, target)
+                    return
+                else:
+                    # Skip creating adapter for non-first layers if first layer adapter doesn't exist yet
+                    return
+            else:
+                # This is the first layer, create the adapter and store it for sharing
+                print(f"USING USE_LAST: Creating shared adapter for module type '{module_type}' in first layer {layer_idx}")
         
         new_module = self._create_new_module(fastlora_config, adapter_name, target, **kwargs)
         if adapter_name not in self.active_adapters:
@@ -1380,10 +1479,59 @@ class FastLoraModel(LoraModel):
             new_module.requires_grad_(False)
             
         # Store the adapter for sharing in use_last mode
-        if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last and layer_idx == self.model.config.num_hidden_layers - 1:
-            self.last_layer_adapters[module_type] = new_module
+        if hasattr(fastlora_config, 'fastlora_use_last') and fastlora_config.fastlora_use_last and layer_idx == 0:
+            self.first_layer_adapters[module_type] = new_module
             
         self._replace_module(parent, target_name, new_module, target)
+
+    def _share_adapter_parameters(self, target_module, source_module):
+        """
+        Share adapter parameters between modules for use_last mode.
+        
+        This creates separate FastLoraLinear instances but makes them share
+        the same parameter tensors for memory efficiency while allowing
+        different layer_idx values for correct layer embeddings.
+        
+        Args:
+            target_module: The new module that should share parameters
+            source_module: The first layer module whose parameters to share
+        """
+        # Share all the FastLoRA adapter parameters (actual tensor objects)
+        if hasattr(source_module, 'fastlora_A1') and source_module.fastlora_A1 is not None:
+            target_module.fastlora_A1 = source_module.fastlora_A1
+            
+        if hasattr(source_module, 'fastlora_A2') and source_module.fastlora_A2 is not None:  
+            target_module.fastlora_A2 = source_module.fastlora_A2
+            
+        if hasattr(source_module, 'fastlora_A3') and source_module.fastlora_A3 is not None:
+            target_module.fastlora_A3 = source_module.fastlora_A3
+            
+        if hasattr(source_module, 'fastlora_B') and source_module.fastlora_B is not None:
+            target_module.fastlora_B = source_module.fastlora_B
+            
+        # Share pre-computed ss matrices if they exist
+        if hasattr(source_module, 'fastlora_ss') and source_module.fastlora_ss is not None:
+            target_module.fastlora_ss = source_module.fastlora_ss
+        
+        # IMPORTANT: Share layer embeddings but NOT the layer_idx!
+        # Each instance keeps its own layer_idx but shares the embedding tensor
+        if hasattr(source_module, 'fastlora_layer_embedding') and source_module.fastlora_layer_embedding is not None:
+            target_module.fastlora_layer_embedding = source_module.fastlora_layer_embedding
+            
+        # Share module embeddings
+        if hasattr(source_module, 'fastlora_module_embedding') and source_module.fastlora_module_embedding is not None:
+            target_module.fastlora_module_embedding = source_module.fastlora_module_embedding
+            target_module.module_type_to_id = source_module.module_type_to_id
+            
+        # Share any context refiner components (deep refiner)
+        if hasattr(source_module, 'fastlora_context_refiner') and source_module.fastlora_context_refiner is not None:
+            target_module.fastlora_context_refiner = source_module.fastlora_context_refiner
+            
+        # Share normalization components
+        if hasattr(source_module, 'fastlora_hidden_state_norm') and source_module.fastlora_hidden_state_norm is not None:
+            target_module.fastlora_hidden_state_norm = source_module.fastlora_hidden_state_norm
+            
+        print(f"SHARED PARAMETERS: Layer {target_module.layer_idx} '{target_module.module_type}' now shares adapter params with layer 0 (keeping own layer_idx={target_module.layer_idx})")
 
     def _create_new_module(self, fastlora_config, adapter_name, target, **kwargs):
         return FastLoraLinear(target, **kwargs)
@@ -1423,9 +1571,12 @@ class FastLoraModelForCausalLM(PeftModelForCausalLM):
 
         if fastlora_hidden_states_and_mask is not None:
             mode = "states"
+            print(f"[GENERATION DEBUG] Using 'states' mode with hidden states")
             assert input_ids.dim() == 2, "input_ids should be 2D tensor in states mode"
             assert fastlora_weights is None, "fastlora_weights should be None in states mode"
             fastlora_hidden_states, fastlora_attension_mask = fastlora_hidden_states_and_mask
+            print(f"[GENERATION DEBUG] Hidden states shape: {[h.shape for h in fastlora_hidden_states]}")
+            print(f"[GENERATION DEBUG] Attention mask shape: {fastlora_attension_mask.shape}")
             assert fastlora_hidden_states[0].dim() == 4, "fastlora_hidden_states should be 4D tensor (batch_size x num_segments x seq_len x hidden_size)"
             assert fastlora_attension_mask.dim() == 3, "fastlora_mask should be 3D tensor (batch_size x num_segments x seq_len)"
             assert fastlora_hidden_states[0].shape[:-1] == fastlora_attension_mask.shape, "fastlora_hidden_states and fastlora_mask should have the same shape"
@@ -1458,11 +1609,12 @@ class FastLoraModelForCausalLM(PeftModelForCausalLM):
                 
                 # Handle use_last mode: use last layer's hidden states for all layers
                 if hasattr(self.peft_config['default'], 'fastlora_use_last') and self.peft_config['default'].fastlora_use_last:
-                    # In use_last mode, we need to pass all layers' hidden states
-                    # to the shared adapter and set all_layers_mode flag
-                    args_dict["hidden_states"] = torch.stack(fastlora_hidden_states, dim=1)  # B x num_layers x S x L x D
-                    args_dict["attention_mask"] = fastlora_attension_mask.unsqueeze(1).expand(-1, len(fastlora_hidden_states), -1, -1)  # B x num_layers x S x L
-                    args_dict["all_layers_mode"] = True
+                    # In use_last mode, we need to pass the last layer's hidden states
+                    # to all shared adapters (but each has its own layer_idx now!)
+                    last_layer_hidden_states = fastlora_hidden_states[-1]  # Use last layer's hidden states
+                    args_dict["hidden_states"] = last_layer_hidden_states  # B x S x L x D
+                    args_dict["attention_mask"] = fastlora_attension_mask  # B x S x L
+                    args_dict["use_last_hidden"] = True  # Flag to indicate we're using last layer's hidden states
                 else:
                     # Standard mode: use only the current layer's hidden states
                     args_dict["hidden_states"] = fastlora_hidden_states[layer_idx]
@@ -1477,9 +1629,8 @@ class FastLoraModelForCausalLM(PeftModelForCausalLM):
                 args_dict["hidden_states"] = None
                 args_dict["attention_mask"] = fastlora_attension_mask
                 
-                # Handle use_last mode for default mode
-                if hasattr(self.peft_config['default'], 'fastlora_use_last') and self.peft_config['default'].fastlora_use_last:
-                    args_dict["all_layers_mode"] = True
+                # Note: all_layers_mode should NOT be set in default mode
+                # It's only for "states" mode where we have stacked hidden states
             else:
                 raise ValueError(f"Unknown mode: {mode}")
             args_dict["batch_size"] = B
