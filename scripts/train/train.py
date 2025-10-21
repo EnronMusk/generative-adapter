@@ -81,6 +81,7 @@ def main():
             enable_reconstruct=(model_args.fastlora_training_attention_mask and model_args.fastlora_training_attention_mask.startswith("abcdabcd")),
             seed=training_args.seed,
             cache_dir=model_args.dataset_cache_dir,
+            max_train_samples=model_args.max_train_samples,
         )
 
     with training_args.main_process_first():
@@ -93,6 +94,7 @@ def main():
             min_length=training_args.eval_min_length,
             window_size=model_args.fastlora_window,
             chat_template=model_args.chat_template,
+            max_eval_num=model_args.max_eval_samples,
             seed=training_args.seed,
             cache_dir=model_args.dataset_cache_dir,
         )
