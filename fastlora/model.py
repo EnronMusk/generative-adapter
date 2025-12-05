@@ -86,6 +86,128 @@ class BatchNorm(nn.Module):
         hidden_states = (hidden_states - mean) * torch.rsqrt(variance + self.variance_epsilon)
         return (self.weight * hidden_states + self.bias).to(input_dtype)
 
+
+class OuterProductNorm(nn.Module):
+    def __init__(self, r1, r2, eps=1e-6, dtype=torch.float32):
+        """
+        Learnable normalization for outer product matrices.
+        
+        Similar to LayerNorm but designed for outer product matrices [B, S, R1, R2].
+        Normalizes across all dimensions except batch and sequence, then applies
+        learnable scale and shift parameters.
+        
+        Args:
+            r1: First rank dimension size
+            r2: Second rank dimension size  
+            eps: Epsilon for numerical stability
+            dtype: Data type for parameters
+        """
+        super().__init__()
+        self.r1 = r1
+        self.r2 = r2
+        self.eps = eps
+        
+        # Learnable scale and shift parameters shaped like [R1, R2]
+        self.weight = nn.Parameter(torch.ones(r1, r2, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(r1, r2, dtype=dtype))
+        
+        # Initialize weight to small values to start conservative
+        nn.init.normal_(self.weight, mean=1.0, std=0.1)
+        
+    def reset_parameters(self):
+        nn.init.normal_(self.weight, mean=1.0, std=0.1)
+        nn.init.zeros_(self.bias)
+        
+    def forward(self, outer_product):
+        """
+        Args:
+            outer_product: [B, S, R1, R2] or [B, R1, R2] outer product matrix
+            
+        Returns:
+            normalized_outer_product: Same shape as input, normalized and scaled
+        """
+        input_dtype = outer_product.dtype
+        original_shape = outer_product.shape
+        
+        # Handle both [B, S, R1, R2] and [B, R1, R2] cases
+        if len(original_shape) == 4:
+            B, S, R1, R2 = original_shape
+            # Compute mean and variance across R1, R2 dimensions for each B, S
+            mean = outer_product.mean(dim=(-2, -1), keepdim=True)  # [B, S, 1, 1]
+            var = outer_product.var(dim=(-2, -1), keepdim=True, unbiased=False)  # [B, S, 1, 1]
+        else:  # [B, R1, R2] case
+            B, R1, R2 = original_shape
+            # Compute mean and variance across R1, R2 dimensions for each B
+            mean = outer_product.mean(dim=(-2, -1), keepdim=True)  # [B, 1, 1]
+            var = outer_product.var(dim=(-2, -1), keepdim=True, unbiased=False)  # [B, 1, 1]
+        
+        # Normalize
+        normalized = (outer_product - mean) / torch.sqrt(var + self.eps)
+        
+        # Apply learnable scale and shift
+        # weight and bias are [R1, R2], will broadcast correctly
+        scaled = normalized * self.weight + self.bias
+        
+        return scaled.to(input_dtype)
+
+
+class LearnableFrobeniusNorm(nn.Module):
+    def __init__(self, r1, r2, eps=1e-6, dtype=torch.float32):
+        """
+        Learnable Frobenius normalization for outer product matrices.
+        
+        Normalizes by Frobenius norm ||M||_F = sqrt(sum(M_ij^2)), then applies
+        learnable scale and shift parameters. Unlike OuterProductNorm, this
+        preserves the mean structure while only normalizing the magnitude.
+        
+        Args:
+            r1: First rank dimension size
+            r2: Second rank dimension size  
+            eps: Epsilon for numerical stability
+            dtype: Data type for parameters
+        """
+        super().__init__()
+        self.r1 = r1
+        self.r2 = r2
+        self.eps = eps
+        
+        # Learnable scale and shift parameters shaped like [R1, R2]
+        self.weight = nn.Parameter(torch.ones(r1, r2, dtype=dtype))
+        self.bias = nn.Parameter(torch.zeros(r1, r2, dtype=dtype))
+        
+        # Initialize weight to small values to start conservative
+        nn.init.normal_(self.weight, mean=1.0, std=0.1)
+        
+    def reset_parameters(self):
+        nn.init.normal_(self.weight, mean=1.0, std=0.1)
+        nn.init.zeros_(self.bias)
+        
+    def forward(self, outer_product):
+        """
+        Args:
+            outer_product: [B, S, R1, R2] or [B, R1, R2] outer product matrix
+            
+        Returns:
+            normalized_outer_product: Same shape as input, Frobenius normalized and scaled
+        """
+        input_dtype = outer_product.dtype
+        original_shape = outer_product.shape
+        
+        # Compute Frobenius norm: ||M||_F = sqrt(sum(M_ij^2))
+        frobenius_norm = torch.sqrt(
+            (outer_product ** 2).sum(dim=(-2, -1), keepdim=True) + self.eps
+        )
+        
+        # Normalize by Frobenius norm (preserves mean structure, normalizes magnitude)
+        normalized = outer_product / frobenius_norm
+        
+        # Apply learnable scale and shift
+        # weight and bias are [R1, R2], will broadcast correctly
+        scaled = normalized * self.weight + self.bias
+        
+        return scaled.to(input_dtype)
+
+
 class FastLoraLinear(nn.Module, LoraLayer):
     """
     FastLoRA: Context-dependent LoRA adaptation.
@@ -160,6 +282,11 @@ class FastLoraLinear(nn.Module, LoraLayer):
         fastlora_diag_fix: bool = False,
         fastlora_use_mlp: bool = False,
         fastlora_normalize_ss: bool = False,
+        fastlora_normalize_ss_after_merge: bool = False,
+        fastlora_sqrt_after_merge: bool = False,
+        fastlora_use_linear_strategy: bool = False,
+        fastlora_norm_a1a2a3: bool = False,
+        fastlora_key_denominator_norm: bool = False,
         fastlora_add_embeddings: bool = False,
         fastlora_add_layer_embeddings: bool = False,
         fastlora_use_deep_refiner: bool = False,
@@ -171,8 +298,18 @@ class FastLoraLinear(nn.Module, LoraLayer):
         fastlora_use_activations_after_ss: bool = False,
         fastlora_use_activations_ss_softmax: bool = False,
         fastlora_use_activations_ss_tanh: bool = False,
+        fastlora_use_activations_ss_after_merge: bool = False,
         fastlora_use_square_ss: bool = False,
+        fastlora_bilinear: bool = False,
+        fastlora_outer_product_norm: bool = False,
+        fastlora_learnable_frobenius_norm: bool = False,
+        fastlora_direct_hidden_outer_product: bool = False,
         fastlora_use_last: bool = False,
+        fastlora_use_transformer_blocks: bool = False,
+        fastlora_transformer_layers: int = 2,
+        fastlora_transformer_heads: int = 4,
+        fastlora_transformer_ffn_size: Optional[int] = None,
+        fastlora_transformer_dropout: float = 0.1,
         module_type: str = "unknown",
         layer_idx: int = -1,
         num_layers: int = 32,
@@ -185,7 +322,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
         )
         self.other_param_names = (
             "fastlora_r", "fastlora_max_rank", "fastlora_inter_size", "fastlora_alpha",
-            "fastlora_dropout", "fastlora_arch", "fastlora_norm", "fastlora_init", "fastlora_diag_fix", "fastlora_use_mlp", "fastlora_normalize_ss", "fastlora_add_embeddings", "fastlora_add_layer_embeddings", "fastlora_use_deep_refiner", "fastlora_refiner_layers", "fastlora_refiner_ffn_size", "fastlora_use_activations_a1", "fastlora_use_activations_a2_a3", "fastlora_activation_type", "fastlora_use_activations_after_ss", "fastlora_use_activations_ss_softmax", "fastlora_use_activations_ss_tanh", "fastlora_use_square_ss", "fastlora_use_last"
+            "fastlora_dropout", "fastlora_arch", "fastlora_norm", "fastlora_init", "fastlora_diag_fix", "fastlora_use_mlp", "fastlora_normalize_ss", "fastlora_normalize_ss_after_merge", "fastlora_sqrt_after_merge", "fastlora_use_linear_strategy", "fastlora_norm_a1a2a3", "fastlora_key_denominator_norm", "fastlora_add_embeddings", "fastlora_add_layer_embeddings", "fastlora_use_deep_refiner", "fastlora_refiner_layers", "fastlora_refiner_ffn_size", "fastlora_use_activations_a1", "fastlora_use_activations_a2_a3", "fastlora_activation_type", "fastlora_use_activations_after_ss", "fastlora_use_activations_ss_softmax", "fastlora_use_activations_ss_tanh", "fastlora_use_activations_ss_after_merge", "fastlora_use_square_ss", "fastlora_bilinear", "fastlora_use_last", "fastlora_use_transformer_blocks", "fastlora_transformer_layers", "fastlora_transformer_heads", "fastlora_transformer_ffn_size", "fastlora_transformer_dropout"
         )
 
         # self.parent = parent
@@ -206,6 +343,11 @@ class FastLoraLinear(nn.Module, LoraLayer):
         if fastlora_use_deep_refiner:
             print("  REFINER LAYERS {}".format(fastlora_refiner_layers))
             print("  REFINER FFN SIZE {}".format(fastlora_refiner_ffn_size))
+        print("USING TRANSFORMER BLOCKS {}".format(fastlora_use_transformer_blocks))
+        if fastlora_use_transformer_blocks:
+            print("  TRANSFORMER LAYERS {}".format(fastlora_transformer_layers))
+            print("  TRANSFORMER HEADS {}".format(fastlora_transformer_heads))
+            print("  TRANSFORMER FFN SIZE {}".format(fastlora_transformer_ffn_size))
         print("USING ACTIVATIONS A1 {}".format(fastlora_use_activations_a1))
         print("USING ACTIVATIONS A2/A3 {}".format(fastlora_use_activations_a2_a3))
         print("USING ACTIVATION TYPE {}".format(fastlora_activation_type))
@@ -213,6 +355,10 @@ class FastLoraLinear(nn.Module, LoraLayer):
         print("USING SS SOFTMAX ACTIVATION {}".format(fastlora_use_activations_ss_softmax))
         print("USING SS TANH ACTIVATION {}".format(fastlora_use_activations_ss_tanh))
         print("USING SQUARE SS MATRIX {}".format(fastlora_use_square_ss))
+        print("USING BILINEAR ALTERNATION {}".format(fastlora_bilinear))
+        print("USING OUTER PRODUCT NORM {}".format(fastlora_outer_product_norm))
+        print("USING LEARNABLE FROBENIUS NORM {}".format(fastlora_learnable_frobenius_norm))
+        print("USING DIRECT HIDDEN OUTER PRODUCT {}".format(fastlora_direct_hidden_outer_product))
         print("USING USE_LAST {}".format(fastlora_use_last))
         print("USING MODULE TYPE {}".format(module_type))
         print("USING LAYER IDX {}".format(layer_idx))
@@ -222,6 +368,10 @@ class FastLoraLinear(nn.Module, LoraLayer):
             self.fastlora_max_rank = fastlora_max_rank
             self.fastlora_inter_size = fastlora_inter_size if fastlora_inter_size is not None else self.fastlora_r
             self.fastlora_alpha = fastlora_alpha
+            
+            # Need to assign this BEFORE using it!
+            self.fastlora_use_square_ss = fastlora_use_square_ss
+
             self.fastlora_scaling = fastlora_alpha / fastlora_r
             self.fastlora_arch = fastlora_arch
             self.fastlora_norm = fastlora_norm
@@ -231,24 +381,78 @@ class FastLoraLinear(nn.Module, LoraLayer):
             self.fastlora_diag_fix = fastlora_diag_fix
             self.fastlora_use_mlp = fastlora_use_mlp
             self.fastlora_normalize_ss = fastlora_normalize_ss
+            self.fastlora_normalize_ss_after_merge = fastlora_normalize_ss_after_merge
+            self.fastlora_sqrt_after_merge = fastlora_sqrt_after_merge
+            self.fastlora_use_linear_strategy = fastlora_use_linear_strategy
+            self.fastlora_norm_a1a2a3 = fastlora_norm_a1a2a3
+            self.fastlora_key_denominator_norm = fastlora_key_denominator_norm
             self.fastlora_add_embeddings = fastlora_add_embeddings
             self.fastlora_add_layer_embeddings = fastlora_add_layer_embeddings
             self.fastlora_use_deep_refiner = fastlora_use_deep_refiner
             self.fastlora_refiner_layers = fastlora_refiner_layers
             self.fastlora_refiner_ffn_size = fastlora_refiner_ffn_size if fastlora_refiner_ffn_size is not None else 4 * self.fastlora_inter_size
+            self.fastlora_use_transformer_blocks = fastlora_use_transformer_blocks
+            self.fastlora_transformer_layers = fastlora_transformer_layers
+            self.fastlora_transformer_heads = fastlora_transformer_heads
+            self.fastlora_transformer_ffn_size = fastlora_transformer_ffn_size if fastlora_transformer_ffn_size is not None else 4 * self.fastlora_inter_size
+            self.fastlora_transformer_dropout = fastlora_transformer_dropout
             self.fastlora_use_activations_a1 = fastlora_use_activations_a1
             self.fastlora_use_activations_a2_a3 = fastlora_use_activations_a2_a3
             self.fastlora_activation_type = fastlora_activation_type
             self.fastlora_use_activations_after_ss = fastlora_use_activations_after_ss
             self.fastlora_use_activations_ss_softmax = fastlora_use_activations_ss_softmax
             self.fastlora_use_activations_ss_tanh = fastlora_use_activations_ss_tanh
-            self.fastlora_use_square_ss = fastlora_use_square_ss
+            self.fastlora_use_activations_ss_after_merge = fastlora_use_activations_ss_after_merge
+            # fastlora_use_square_ss already assigned above for scaling calculation
+            self.fastlora_bilinear = fastlora_bilinear
+            self.fastlora_outer_product_norm = fastlora_outer_product_norm
+            self.fastlora_learnable_frobenius_norm = fastlora_learnable_frobenius_norm
+            self.fastlora_direct_hidden_outer_product = fastlora_direct_hidden_outer_product
             self.fastlora_use_last = fastlora_use_last
             self.module_type = module_type
             self.layer_idx = layer_idx
             self.num_layers = num_layers
+            # Step counter for bilinear alternation
+            self.bilinear_step_counter = 0
             self.fastlora_dropout = nn.Dropout(p=fastlora_dropout)
             dtype = self.base_layer.weight.dtype
+            
+            # Initialize outer product normalization layers if enabled
+            if self.fastlora_outer_product_norm and self.fastlora_learnable_frobenius_norm:
+                print("WARNING: Both outer_product_norm and learnable_frobenius_norm are enabled. Using outer_product_norm only.")
+                
+            if self.fastlora_outer_product_norm:
+                # Determine r2 dimension based on square_ss setting
+                r2 = self.fastlora_inter_size if self.fastlora_use_square_ss else self.fastlora_r
+                self.outer_product_norm = OuterProductNorm(
+                    r1=self.fastlora_inter_size,
+                    r2=r2,
+                    dtype=dtype
+                )
+                self.adapter_layer_names = self.adapter_layer_names + ("outer_product_norm",)
+            elif self.fastlora_learnable_frobenius_norm:
+                # Determine r2 dimension based on square_ss setting
+                r2 = self.fastlora_inter_size if self.fastlora_use_square_ss else self.fastlora_r
+                self.learnable_frobenius_norm = LearnableFrobeniusNorm(
+                    r1=self.fastlora_inter_size,
+                    r2=r2,
+                    dtype=dtype
+                )
+                self.adapter_layer_names = self.adapter_layer_names + ("learnable_frobenius_norm",)
+            
+            # Initialize direct hidden outer product projection if enabled
+            if self.fastlora_direct_hidden_outer_product:
+                # Need a projection from [hidden_size, hidden_size] to [R1, R2]
+                r2 = self.fastlora_inter_size if self.fastlora_use_square_ss else self.fastlora_r
+                self.hidden_to_ss_projection = nn.Linear(
+                    hidden_size * hidden_size, 
+                    self.fastlora_inter_size * r2,
+                    bias=False,
+                    dtype=dtype
+                )
+                # Initialize with small values for stability
+                nn.init.normal_(self.hidden_to_ss_projection.weight, mean=0.0, std=0.01)
+                self.adapter_layer_names = self.adapter_layer_names + ("hidden_to_ss_projection",)
             
             # Initialize Deep Context Refiner if enabled
             if self.fastlora_use_deep_refiner:
@@ -261,9 +465,55 @@ class FastLoraLinear(nn.Module, LoraLayer):
                     r2=self.fastlora_r,
                     ffn_hidden_size=self.fastlora_refiner_ffn_size,
                     dropout_rate=fastlora_dropout,
-                    dtype=dtype
+                    dtype=dtype,
+                    fastlora_bilinear=self.fastlora_bilinear,
+                    activation_type=self.fastlora_activation_type  # Pass activation type!
                 )
                 self.adapter_layer_names = self.adapter_layer_names + ("fastlora_context_refiner",)
+            
+            # Initialize Transformer Blocks for hidden state refinement if enabled
+            if self.fastlora_use_transformer_blocks:
+                print("Initializing Transformer Hidden State Refiner")
+                from fastlora.modeling_utils import TransformerHiddenStateRefiner
+                self.transformer_hidden_state_refiner = TransformerHiddenStateRefiner(
+                    hidden_size=hidden_size,
+                    num_layers=self.fastlora_transformer_layers,
+                    num_heads=self.fastlora_transformer_heads,
+                    ffn_hidden_size=self.fastlora_transformer_ffn_size,
+                    dropout_rate=self.fastlora_transformer_dropout,
+                    dtype=dtype,
+                    activation_type=self.fastlora_activation_type
+                )
+                # Count parameters in transformer blocks
+                transformer_params = sum(p.numel() for p in self.transformer_hidden_state_refiner.parameters())
+                print(f"  Transformer refiner params: {transformer_params:,}")
+                self.adapter_layer_names = self.adapter_layer_names + ("transformer_hidden_state_refiner",)
+            
+            # QK-Norm layers for A1, A2, A3 (used by linear strategy or individual norm_a1a2a3)
+            if self.fastlora_use_linear_strategy or self.fastlora_norm_a1a2a3:
+                if self.fastlora_use_linear_strategy:
+                    print("Initializing Linear Attention Strategy (QK-Norm)")
+                else:
+                    print("Initializing A1/A2/A3 Normalization (QK-Norm)")
+                    
+                self.A1_norm = nn.LayerNorm(self.fastlora_inter_size, dtype=dtype)
+                self.A2_norm = nn.LayerNorm(self.fastlora_inter_size, dtype=dtype) 
+                self.A3_norm = nn.LayerNorm(self.fastlora_r if not self.fastlora_use_square_ss else self.fastlora_inter_size, dtype=dtype)
+                
+                # Initialize norms to be conservative (small scale, zero bias)
+                # nn.init.constant_(self.A1_norm.weight, 0.1)
+                # nn.init.constant_(self.A2_norm.weight, 0.1)
+                # nn.init.constant_(self.A3_norm.weight, 0.1)
+                # nn.init.zeros_(self.A1_norm.bias)
+                # nn.init.zeros_(self.A2_norm.bias)
+                # nn.init.zeros_(self.A3_norm.bias)
+                
+                self.adapter_layer_names = self.adapter_layer_names + ("A1_norm", "A2_norm", "A3_norm")
+                print("  QK-Norm layers initialized with conservative scaling")
+            else:
+                self.A1_norm = None
+                self.A2_norm = None
+                self.A3_norm = None
               
             if "batchnorm" in fastlora_norm:
                 self.fastlora_hidden_state_norm = BatchNorm(hidden_size, dtype=dtype)
@@ -740,6 +990,8 @@ class FastLoraLinear(nn.Module, LoraLayer):
         return x
 
     def _normalize(self, ss):
+        if self.fastlora_norm == "none":
+            return ss
         if self.fastlora_norm == "frobenius":
             ss = self._frobenius_norm(ss)
         elif self.fastlora_norm == "spectral":
@@ -765,23 +1017,64 @@ class FastLoraLinear(nn.Module, LoraLayer):
         Apply specific activation functions to the ss matrix for stability.
         
         Args:
-            ss: The ss matrix with shape [B, S, R1, R2]
+            ss: The ss matrix with shape [B, S, R1, R2] (before merge) or [B, S1, R1, R2] (after merge)
             
         Returns:
-            Activated ss matrix with same shape
+            Activated ss matrix with same shape as input
         """
         if self.fastlora_use_activations_ss_softmax:
             # Apply softmax along the R2 dimension (value dimension) for each R1 dimension
             # This is similar to attention weights normalization
+            # Input: [B, S, R1, R2] -> Output: [B, S, R1, R2] (softmax normalized)
             ss = F.softmax(ss, dim=-1)  # Softmax over last dimension (R2)
             
         elif self.fastlora_use_activations_ss_tanh:
             # Apply tanh for bounded values between -1 and 1
             # This prevents extreme activations and provides stability
+            # Input: [B, S, R1, R2] -> Output: [B, S, R1, R2] (values clamped to [-1, 1])
             ss = torch.tanh(ss)
             
         return ss
 
+    def _compute_bilinear_ss(self, c_key_states, c_value_states):
+        """
+        Compute ss matrix with optional alternating gradient detachment for stability.
+        
+        This method handles both bilinear and non-bilinear computation modes:
+        - If fastlora_bilinear=True: Uses alternating gradient detachment 
+        - If fastlora_bilinear=False: Uses standard outer product computation
+        - If fastlora_outer_product_norm=True: Applies learnable normalization (works with both modes)
+        
+        Args:
+            c_key_states: [B, S, L, R1] key projections
+            c_value_states: [B, S, L, R2] value projections
+            
+        Returns:
+            ss: [B, S, R1, R2] outer product matrix, optionally normalized
+        """
+        if self.fastlora_bilinear and self.training:
+            # Increment step counter
+            self.bilinear_step_counter += 1
+            
+            # Alternate which tensor gets detached based on step counter
+            # Even steps: detach c_key_states, odd steps: detach c_value_states
+            if self.bilinear_step_counter % 2 == 0:
+                # Detach key states - gradients flow through value states only
+                ss = c_key_states.detach().transpose(-2, -1) @ c_value_states
+            else:
+                # Detach value states - gradients flow through key states only  
+                ss = c_key_states.transpose(-2, -1) @ c_value_states.detach()
+        else:
+            # Standard computation - gradients flow through both
+            ss = c_key_states.transpose(-2, -1) @ c_value_states
+        
+        # Apply learnable normalization if enabled
+        if self.fastlora_outer_product_norm:
+            ss = self.outer_product_norm(ss)
+        elif self.fastlora_learnable_frobenius_norm:
+            ss = self.learnable_frobenius_norm(ss)
+            
+        return ss
 
     def _kv_mapping_matrix(self, hidden_states_norm, attention_mask, outer_product=None, merge_target_size=None, merge_is_caual=False):
         assert merge_target_size is not None, "merge_target_size is required for post-norm"
@@ -799,23 +1092,56 @@ class FastLoraLinear(nn.Module, LoraLayer):
             c_key_states = self.fastlora_A2(c_key_states)   # B, S2, RM, R1
             c_value_states = c_centroids.transpose(-2, -1) @ hidden_states_norm    # B, S2, RM, D
             c_value_states = self.fastlora_A3(c_value_states)   # B, S2, RM, R2
-            ss = c_key_states.transpose(-2, -1) @ c_value_states    # B, S2, R1, R2
+            ss = self._compute_bilinear_ss(c_key_states, c_value_states)    # B, S2, R1, R2
             
             ss = self._frobenius_norm(ss)
 
         else:
-            c_key_states = self.fastlora_A2(hidden_states_norm)   # B, S2, L2, R1
-            c_value_states = self.fastlora_A3(hidden_states_norm)    # B, S2, L2, R2
-            
-            # Apply activations after A2/A3 if enabled
-            if self.fastlora_use_activations_a2_a3:
-                activation_fn = get_activation_fn(self.fastlora_activation_type)
-                c_key_states = activation_fn(c_key_states)
-                c_value_states = activation_fn(c_value_states)
-            
-            c_key_states = c_key_states * attention_mask.unsqueeze(-1)   # B, S2, L2, R1
-            c_value_states = c_value_states * attention_mask.unsqueeze(-1)  # B, S2, L2, R2
-            ss = c_key_states.transpose(-2, -1) @ c_value_states    # B, S2, R1, R2
+            if self.fastlora_direct_hidden_outer_product:
+                # Bypass A2/A3 projections and compute outer product directly from hidden states
+                # Apply attention mask first
+                masked_hidden = hidden_states_norm * attention_mask.unsqueeze(-1)   # B, S2, L2, D
+                
+                # Compute direct outer product H^T @ H: [B, S2, D, D]
+                ss_raw = masked_hidden.transpose(-2, -1) @ masked_hidden  # B, S2, D, D
+                
+                # Flatten to [B, S2, D*D] and project to [B, S2, R1*R2]
+                B, S2, D, _ = ss_raw.shape
+                r2 = self.fastlora_inter_size if self.fastlora_use_square_ss else self.fastlora_r
+                ss_flat = ss_raw.view(B, S2, D * D)  # B, S2, D*D
+                ss_projected = self.hidden_to_ss_projection(ss_flat)  # B, S2, R1*R2
+                ss = ss_projected.view(B, S2, self.fastlora_inter_size, r2)  # B, S2, R1, R2
+            else:
+                c_key_states = self.fastlora_A2(hidden_states_norm)   # B, S2, L2, R1
+                c_value_states = self.fastlora_A3(hidden_states_norm)    # B, S2, L2, R2
+                
+                # Apply QK-Norm (from linear strategy or individual norm_a1a2a3)
+                if self.fastlora_use_linear_strategy or self.fastlora_norm_a1a2a3:
+                    c_key_states = self.A2_norm(c_key_states)      # Normalize keys  
+                    c_value_states = self.A3_norm(c_value_states)  # Normalize values
+                
+                # Apply activations after A2/A3 if enabled
+                if self.fastlora_use_activations_a2_a3:
+                    activation_fn = get_activation_fn(self.fastlora_activation_type)
+                    c_key_states = activation_fn(c_key_states)
+                    c_value_states = activation_fn(c_value_states)
+                
+                c_key_states = c_key_states * attention_mask.unsqueeze(-1)   # B, S2, L2, R1
+                c_value_states = c_value_states * attention_mask.unsqueeze(-1)  # B, S2, L2, R2
+                ss = self._compute_bilinear_ss(c_key_states, c_value_states)    # B, S2, R1, R2
+                
+                # Apply Explicit Denominator Normalization (from linear strategy or individual key_denominator_norm)
+                if self.fastlora_use_linear_strategy or self.fastlora_key_denominator_norm:
+                    # Compute the sum of keys (denominator) like in linear attention
+                    # sum_keys = sum_j phi(k_j) for each query position
+                    key_sum = c_key_states.sum(dim=2, keepdim=True)  # B, S2, 1, R1 - sum over L2 (token) dimension
+                    key_sum = key_sum.clamp(min=1e-8)  # Avoid division by zero
+                    
+                    # Normalize ss by the key sum (like linear attention denominator)
+                    # This is equivalent to: ss_normalized = ss / (query @ key_sum)
+                    # But since ss = key^T @ value, we normalize by key_sum magnitude
+                    key_norm = torch.norm(key_sum, dim=-1, keepdim=True).clamp(min=1e-8)  # B, S2, 1, 1
+                    ss = ss / key_norm  # B, S2, R1, R2
             
             # Add module-specific embedding bias
             if self.fastlora_add_embeddings:
@@ -828,15 +1154,18 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 layer_emb = self.fastlora_layer_embedding[self.layer_idx]  # [R1, R2]
                 ss = ss + layer_emb.unsqueeze(0).unsqueeze(0)  # Broadcast to [B, S2, R1, R2]
             
-            # Scale by sqrt(sequence_length) like attention does with sqrt(d_k)
+            # Scale by sqrt(sequence_length) like attention does with sqrt(d_k) - BEFORE merging
             # This bounds the magnitude regardless of sequence length and prevents
             # magnitude explosion when summing over many tokens
-            if self.fastlora_normalize_ss or self.fastlora_norm == "svd_y":
+            # Only apply here if NOT using after_merge flag
+            if (self.fastlora_normalize_ss or self.fastlora_norm == "svd_y") and not self.fastlora_normalize_ss_after_merge:
                 tokens_count = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)    # B, S2, 1, 1
                 ss = ss / torch.sqrt(tokens_count.clamp(min=1))  # B, S2, R1, R2
 
-            # Apply ss activations for stability (softmax or tanh)
-            ss = self._apply_ss_activations(ss)
+            # Apply ss activations for stability (softmax or tanh) - BEFORE merging
+            # Only apply here if NOT using after_merge flag
+            if not self.fastlora_use_activations_ss_after_merge:
+                ss = self._apply_ss_activations(ss)  # [B, S2, R1, R2] -> [B, S2, R1, R2]
 
             if self.fastlora_merge.startswith("pre-norm-"):
                 ss = ss.unsqueeze(1).expand(-1, merge_target_size, -1, -1, -1)    # B, S1, S2, R1, R2
@@ -871,6 +1200,29 @@ class FastLoraLinear(nn.Module, LoraLayer):
                             ss_pre = ss[:, 1:, :, :]    # B, S1-1, R1, R2
                             ss_post = self._normalize(ss_pre)   # B, S1-1, R1, R2
                             ss = torch.cat([torch.zeros_like(ss[:, :1]), ss_post], dim=1)    # B, S1, R1, R2
+                
+                # Apply token normalization - AFTER merging and normalization
+                # Only apply here if using after_merge flag
+                if self.fastlora_normalize_ss_after_merge and (self.fastlora_normalize_ss or self.fastlora_norm == "svd_y"):
+                    tokens_count = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)    # [B, S2, 1, 1]
+                    # For after-merge, we need to handle the merged dimension properly
+                    # ss shape is [B, S1, R1, R2] after merging
+                    if len(tokens_count.shape) == 4 and len(ss.shape) == 4:
+                        # Expand tokens_count to match ss shape for broadcasting
+                        tokens_count = tokens_count.expand(-1, ss.shape[1], -1, -1)  # [B, S1, 1, 1]
+                    ss = ss / torch.sqrt(tokens_count.clamp(min=1))  # [B, S1, R1, R2] -> [B, S1, R1, R2]
+                
+                # Apply sqrt normalization to final merged ss matrix - AFTER merging and normalization
+                # Alternative to token-based scaling
+                if self.fastlora_sqrt_after_merge:
+                    # Apply element-wise sqrt to the final merged ss matrix
+                    # This is different from token scaling - it's a direct sqrt of the matrix values
+                    ss = torch.sqrt(torch.abs(ss) + 1e-8) * torch.sign(ss)  # [B, S1, R1, R2] -> [B, S1, R1, R2]
+                
+                # Apply ss activations for stability (softmax or tanh) - AFTER merging and normalization
+                # Only apply here if using after_merge flag
+                if self.fastlora_use_activations_ss_after_merge:
+                    ss = self._apply_ss_activations(ss)  # [B, S1, R1, R2] -> [B, S1, R1, R2]
                     
             else:
                 raise NotImplementedError("post-norm is not implemented yet")
@@ -921,7 +1273,14 @@ class FastLoraLinear(nn.Module, LoraLayer):
         # Step 1: normalize the hidden states
         hidden_states_norm = self.fastlora_hidden_state_norm(hidden_states)
 
-           # Step 1: Refine and normalize the hidden states
+        # Step 1.5: Apply Transformer Blocks for hidden state refinement (prepended before outer product computation)
+        if self.fastlora_use_transformer_blocks:
+            # Apply transformer blocks to refine hidden states
+            # Input: [B, S2, L2, H], Output: [B, S2, L2, H]
+            
+            hidden_states_norm = self.transformer_hidden_state_refiner(hidden_states_norm)
+
+        # Step 1: Refine and normalize the hidden states
         if self.fastlora_use_deep_refiner:
             # Apply Deep Context Refiner: H_raw → H_refined → H_norm
             # The refiner projects to inter_size and applies stacked refinement blocks
@@ -932,6 +1291,12 @@ class FastLoraLinear(nn.Module, LoraLayer):
             x_query_states = self.fastlora_A1(x)     # B, S1, L1, R1
             c_key_states = self.fastlora_A2(hidden_states_norm)   # B, S2, L2, R1
             c_value_states = self.fastlora_A3(hidden_states_norm)    # B, S2, L2, R2
+            
+            # Apply QK-Norm (from linear strategy or individual norm_a1a2a3)
+            if self.fastlora_use_linear_strategy or self.fastlora_norm_a1a2a3:
+                x_query_states = self.A1_norm(x_query_states)  # Normalize queries
+                c_key_states = self.A2_norm(c_key_states)      # Normalize keys  
+                c_value_states = self.A3_norm(c_value_states)  # Normalize values
             # print("x_query_states", x_query_states[:, 1, :8, :8])
             # print("c_key_states", c_key_states[:, 0, :8, :8])
             # print("c_value_states", c_value_states[:, 0, :8, :8])
@@ -961,6 +1326,10 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 raise ValueError("pre-norm is not supported in softmax mode")
         else:
             x_query_states = self.fastlora_A1(x)     # B, S1, L1, R1
+            
+            # Apply QK-Norm for queries (from linear strategy or individual norm_a1a2a3)
+            if self.fastlora_use_linear_strategy or self.fastlora_norm_a1a2a3:
+                x_query_states = self.A1_norm(x_query_states)  # Normalize queries
             
             # Apply activation after A1 if enabled
             if self.fastlora_use_activations_a1:
@@ -1072,7 +1441,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
             c_value_states = c_value_states * attention_mask.unsqueeze(-1)  # [B, S, L, R2]
             
             # Compute base ss matrix (same for all layers before adding embeddings)
-            base_ss = c_key_states.transpose(-2, -1) @ c_value_states    # [B, S, R1, R2]
+            base_ss = self._compute_bilinear_ss(c_key_states, c_value_states)    # [B, S, R1, R2]
             
             # Step 4: Add module-specific embedding bias (same for all layers)
             if self.fastlora_add_embeddings:
@@ -1092,8 +1461,9 @@ class FastLoraLinear(nn.Module, LoraLayer):
                 # No layer embeddings, just expand base_ss to all layers
                 ss_all_layers = base_ss.unsqueeze(1).expand(B, num_layers, S, -1, -1)  # [B, num_layers, S, R1, R2]
             
-            # Step 6: Apply scaling by sqrt(sequence_length) if enabled
-            if self.fastlora_normalize_ss or self.fastlora_norm == "svd_y":
+            # Step 6: Apply scaling by sqrt(sequence_length) if enabled - BEFORE merging
+            # Only apply here if NOT using after_merge flag
+            if (self.fastlora_normalize_ss or self.fastlora_norm == "svd_y") and not self.fastlora_normalize_ss_after_merge:
                 tokens_count = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)    # [B, S, 1, 1]
                 tokens_count = tokens_count.unsqueeze(1)  # [B, 1, S, 1, 1]
                 ss_all_layers = ss_all_layers / torch.sqrt(tokens_count.clamp(min=1))  # [B, num_layers, S, R1, R2]
@@ -1133,6 +1503,23 @@ class FastLoraLinear(nn.Module, LoraLayer):
                         ss_pre = ss_layer[:, :1, :, :]    # [B, 1, R1, R2]
                         ss_post = self._normalize(ss_pre)   # [B, 1, R1, R2]
                         ss_layer = ss_post.expand(-1, S, -1, -1)  # [B, S, R1, R2]
+                    
+                    # Apply token normalization - AFTER merging and normalization (parallel path)
+                    # Only apply here if using after_merge flag
+                    if self.fastlora_normalize_ss_after_merge and (self.fastlora_normalize_ss or self.fastlora_norm == "svd_y"):
+                        tokens_count = attention_mask.sum(dim=-1, keepdim=True).unsqueeze(-1)    # [B, S, 1, 1]
+                        ss_layer = ss_layer / torch.sqrt(tokens_count.clamp(min=1))  # [B, S, R1, R2] -> [B, S, R1, R2]
+                    
+                    # Apply sqrt normalization to final merged ss matrix - AFTER merging and normalization (parallel path)
+                    # Alternative to token-based scaling
+                    if self.fastlora_sqrt_after_merge:
+                        # Apply element-wise sqrt to the final merged ss matrix
+                        ss_layer = torch.sqrt(torch.abs(ss_layer) + 1e-8) * torch.sign(ss_layer)  # [B, S, R1, R2] -> [B, S, R1, R2]
+                    
+                    # Apply ss activations for stability (softmax or tanh) - AFTER merging and normalization (parallel path)
+                    # Only apply here if using after_merge flag
+                    if self.fastlora_use_activations_ss_after_merge:
+                        ss_layer = self._apply_ss_activations(ss_layer)  # [B, S, R1, R2] -> [B, S, R1, R2]
                     
                     ss_normalized_list.append(ss_layer.unsqueeze(1))  # [B, 1, S, R1, R2]
                 
@@ -1296,7 +1683,7 @@ class FastLoraLinear(nn.Module, LoraLayer):
             c_value_states = self.fastlora_A3(hidden_states_norm)    # B, S2, L2, R2
             c_key_states = c_key_states * attention_mask.unsqueeze(-1)   # B, S2, L2, R1
             c_value_states = c_value_states * attention_mask.unsqueeze(-1)  # B, S2, L2, R2
-            ss = c_key_states.transpose(-2, -1) @ c_value_states    # B, S2, R1, R2
+            ss = self._compute_bilinear_ss(c_key_states, c_value_states)    # B, S2, R1, R2
             assert self.fastlora_merge == "pre-norm-sum", f"fastlora_norm: {self.fastlora_norm}"
             ss = ss.sum(dim=1)    # B, R1, R2
             if outer_product is not None:
@@ -1424,6 +1811,11 @@ class FastLoraModel(LoraModel):
             "fastlora_diag_fix": fastlora_config.fastlora_diag_fix,
             "fastlora_use_mlp": fastlora_config.fastlora_use_mlp,
             "fastlora_normalize_ss": fastlora_config.fastlora_normalize_ss,
+            "fastlora_normalize_ss_after_merge": getattr(fastlora_config, 'fastlora_normalize_ss_after_merge', False),
+            "fastlora_sqrt_after_merge": getattr(fastlora_config, 'fastlora_sqrt_after_merge', False),
+            "fastlora_use_linear_strategy": getattr(fastlora_config, 'fastlora_use_linear_strategy', False),
+            "fastlora_norm_a1a2a3": getattr(fastlora_config, 'fastlora_norm_a1a2a3', False),
+            "fastlora_key_denominator_norm": getattr(fastlora_config, 'fastlora_key_denominator_norm', False),
             "fastlora_add_embeddings": fastlora_config.fastlora_add_embeddings,
             "fastlora_add_layer_embeddings": fastlora_config.fastlora_add_layer_embeddings,
             "fastlora_use_deep_refiner": fastlora_config.fastlora_use_deep_refiner,
@@ -1436,10 +1828,30 @@ class FastLoraModel(LoraModel):
             "fastlora_use_activations_ss_softmax": fastlora_config.fastlora_use_activations_ss_softmax,
             "fastlora_use_activations_ss_tanh": fastlora_config.fastlora_use_activations_ss_tanh,
             "fastlora_use_square_ss": fastlora_config.fastlora_use_square_ss,
+            "fastlora_bilinear": fastlora_config.fastlora_bilinear,
+            "fastlora_outer_product_norm": fastlora_config.fastlora_outer_product_norm,
+            "fastlora_learnable_frobenius_norm": fastlora_config.fastlora_learnable_frobenius_norm,
+            "fastlora_direct_hidden_outer_product": fastlora_config.fastlora_direct_hidden_outer_product,
             "module_type": module_type,
             "layer_idx": layer_idx,
             "num_layers": self.model.config.num_hidden_layers,
         }
+        
+        # Add transformer blocks parameters
+        if hasattr(fastlora_config, 'fastlora_use_transformer_blocks'):
+            kwargs["fastlora_use_transformer_blocks"] = fastlora_config.fastlora_use_transformer_blocks
+        if hasattr(fastlora_config, 'fastlora_transformer_layers'):
+            kwargs["fastlora_transformer_layers"] = fastlora_config.fastlora_transformer_layers
+        if hasattr(fastlora_config, 'fastlora_transformer_heads'):
+            kwargs["fastlora_transformer_heads"] = fastlora_config.fastlora_transformer_heads
+        if hasattr(fastlora_config, 'fastlora_transformer_ffn_size'):
+            kwargs["fastlora_transformer_ffn_size"] = fastlora_config.fastlora_transformer_ffn_size
+        if hasattr(fastlora_config, 'fastlora_transformer_dropout'):
+            kwargs["fastlora_transformer_dropout"] = fastlora_config.fastlora_transformer_dropout
+        
+        # Add after merge activation parameter
+        if hasattr(fastlora_config, 'fastlora_use_activations_ss_after_merge'):
+            kwargs["fastlora_use_activations_ss_after_merge"] = fastlora_config.fastlora_use_activations_ss_after_merge
         
         # Add use_last flag to the module
         if hasattr(fastlora_config, 'fastlora_use_last'):
@@ -1526,6 +1938,18 @@ class FastLoraModel(LoraModel):
         # Share any context refiner components (deep refiner)
         if hasattr(source_module, 'fastlora_context_refiner') and source_module.fastlora_context_refiner is not None:
             target_module.fastlora_context_refiner = source_module.fastlora_context_refiner
+        
+        # Share transformer blocks refiner components
+        if hasattr(source_module, 'transformer_hidden_state_refiner') and source_module.transformer_hidden_state_refiner is not None:
+            target_module.transformer_hidden_state_refiner = source_module.transformer_hidden_state_refiner
+        
+        # Share QK-Norm components (linear attention strategy)
+        if hasattr(source_module, 'A1_norm') and source_module.A1_norm is not None:
+            target_module.A1_norm = source_module.A1_norm
+        if hasattr(source_module, 'A2_norm') and source_module.A2_norm is not None:
+            target_module.A2_norm = source_module.A2_norm
+        if hasattr(source_module, 'A3_norm') and source_module.A3_norm is not None:
+            target_module.A3_norm = source_module.A3_norm
             
         # Share normalization components
         if hasattr(source_module, 'fastlora_hidden_state_norm') and source_module.fastlora_hidden_state_norm is not None:

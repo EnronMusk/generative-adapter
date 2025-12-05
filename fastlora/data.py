@@ -266,7 +266,7 @@ class Data:
         return outputs
 
     @staticmethod
-    def prepare_train_data(data_files=None, tokenizer=None, max_length=4096, min_length=512, window_size=1024, chat_template="vicuna", enable_reconstruct=False, seed=42, cache_dir=None, load_from_cache_file=None, max_train_samples=None):
+    def prepare_train_data(data_files=None, tokenizer=None, max_length=256, min_length=32, window_size=1024, chat_template="vicuna", enable_reconstruct=False, seed=42, cache_dir=None, load_from_cache_file=None, max_train_samples=None):
         if data_files is None:
             return None
 
@@ -358,7 +358,7 @@ class Data:
         return dataset
 
     @staticmethod
-    def prepare_eval_data(data_files=None, tokenizer=None, max_length=4096, min_length=512, window_size=1024, chat_template="vicuna", max_eval_num=None, cache_dir=None, seed=42, load_from_cache_file=None):
+    def prepare_eval_data(data_files=None, tokenizer=None, max_length=256, min_length=32, window_size=1024, chat_template="vicuna", max_eval_num=None, cache_dir=None, seed=42, load_from_cache_file=None):
         if data_files is None:
             return None
 
