@@ -121,6 +121,13 @@ def get_fastlora_model_and_tokenizer(model_args, device="cpu", evaluation_mode=T
         # FIXME: temporary solution to load base model
         peft_config.fastlora_training_attention_mask = fastlora_kwargs.get("fastlora_training_attention_mask", None)
 
+        # Override checkpoint config with command-line args
+        # FIXME: temporary solution to load base model
+        for k, v in fastlora_kwargs.items():
+            if hasattr(peft_config, k):
+                setattr(peft_config, k, v)
+                print(f"[INFO] Overriding config: {k} = {v}")
+
         base_model_path = peft_config.base_model_name_or_path
         assert base_model_path is not None, "base_model_name_or_path should not be None"
         base_model = AutoModelForCausalLM.from_pretrained(
