@@ -380,6 +380,7 @@ class DefaultDataCollator:
 
     keys_to_pad = {"input_ids", "attention_mask", "labels"}
     keys_to_tensorize = {"input_ids", "attention_mask", "labels", "position_ids", "token_type_ids", "length", "depth", "index"}
+    keys_to_keep_as_list = {"ground_truth_text", "query_text", "context_text"}  # Raw text fields for evaluation
 
     def __call__(self, batch_elem: List) -> Dict[str, Any]:
         import torch.nn.functional as F
@@ -408,6 +409,9 @@ class DefaultDataCollator:
                     )
             elif key in self.keys_to_tensorize:
                 batch_value = torch.tensor(batch_value)
+            elif key in self.keys_to_keep_as_list:
+                # Keep raw text as list of strings for evaluation
+                pass  # batch_value is already a list
             else:
                 raise ValueError(f"Key {key} not recognized!")
 

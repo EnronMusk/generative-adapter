@@ -42,7 +42,7 @@ class ModelArgs:
     )
     padding_side: str = field(
         default="left",
-        metadata={'help': 'Tokenizer padding side.'}
+        metadata={'help': 'Tokenizer padding side. Always use left padding.'}
     )
     no_use_fast: bool = field(
         default=False,
@@ -256,6 +256,26 @@ class ModelArgs:
         default=False,
         metadata={'help': 'Normalize ss matrix by sqrt(token_count) after key@value multiplication to prevent magnitude explosion.'}
     )
+    fastlora_normalize_ss_after_merge: bool = field(
+        default=False,
+        metadata={'help': 'Apply 1/sqrt(token_count) scaling after merging instead of before merging for final merged product normalization.'}
+    )
+    fastlora_sqrt_after_merge: bool = field(
+        default=False,
+        metadata={'help': 'Apply sqrt normalization to the final merged ss matrix instead of token-based scaling.'}
+    )
+    fastlora_use_linear_strategy: bool = field(
+        default=False,
+        metadata={'help': 'Use linear attention stabilization strategies: QK-Norm on A1/A2/A3, explicit denominator normalization, and spectral norm constraints.'}
+    )
+    fastlora_norm_a1a2a3: bool = field(
+        default=False,
+        metadata={'help': 'Apply LayerNorm to A1, A2, A3 outputs (QK-Norm) with conservative 0.1 scaling for projection stabilization.'}
+    )
+    fastlora_key_denominator_norm: bool = field(
+        default=False,
+        metadata={'help': 'Apply explicit denominator normalization using key sum magnitude (like linear attention denominator).'}
+    )
     fastlora_add_embeddings: bool = field(
         default=False,
         metadata={'help': 'Add learnable module-type embeddings to allow different adaptation patterns for different module types (q_proj, k_proj, etc.).'}
@@ -282,6 +302,38 @@ class ModelArgs:
         default=False,
         metadata={'help': 'Add activation after the ss matrix multiplication (query @ ss) before applying B.'}
     )
+    fastlora_use_activations_ss_softmax: bool = field(
+        default=False,
+        metadata={'help': 'Apply softmax activation to ss matrix for stability (like attention mechanism).'}
+    )
+    fastlora_use_activations_ss_tanh: bool = field(
+        default=False,
+        metadata={'help': 'Apply tanh activation to ss matrix for stability and bounded values.'}
+    )
+    fastlora_use_activations_ss_after_merge: bool = field(
+        default=False,
+        metadata={'help': 'Apply ss activations (softmax/tanh) after merging instead of before merging for final merged product activation.'}
+    )
+    fastlora_use_square_ss: bool = field(
+        default=False,
+        metadata={'help': 'Use square ss matrix [inter_size, inter_size] instead of [inter_size, r] for richer interactions.'}
+    )
+    fastlora_bilinear: bool = field(
+        default=False,
+        metadata={'help': 'Alternate between detaching c_key_states and c_value_states for gradient stability in bilinear ss computation.'}
+    )
+    fastlora_outer_product_norm: bool = field(
+        default=False,
+        metadata={'help': 'Apply learnable normalization to outer product matrix for gradient stability (like LayerNorm but for the entire outer product).'}
+    )
+    fastlora_learnable_frobenius_norm: bool = field(
+        default=False,
+        metadata={'help': 'Apply learnable Frobenius normalization to outer product matrix (normalizes magnitude while preserving mean structure).'}
+    )
+    fastlora_direct_hidden_outer_product: bool = field(
+        default=False,
+        metadata={'help': 'Bypass A2/A3 projections and compute outer product directly from hidden states (H^T @ H). Useful for testing if projections contribute to gradient explosion.'}
+    )
     
     # Deep Context Refiner (Transformer-based hypernetwork) arguments
     fastlora_use_deep_refiner: bool = field(
@@ -303,6 +355,28 @@ class ModelArgs:
     fastlora_use_last: bool = field(
         default=False,
         metadata={'help': 'Share FastLoRA adapters across layers, using only the last layer\'s adapters with layer embeddings for differentiation. Automatically enables layer embeddings.'}
+    )
+    
+    # Transformer blocks for hidden state refinement (prepended before outer product computation)
+    fastlora_use_transformer_blocks: bool = field(
+        default=False,
+        metadata={'help': 'Use transformer blocks to refine hidden states before outer product weight prediction.'}
+    )
+    fastlora_transformer_layers: Optional[int] = field(
+        default=2,
+        metadata={'help': 'Number of transformer layers for hidden state refinement.'}
+    )
+    fastlora_transformer_heads: Optional[int] = field(
+        default=4,
+        metadata={'help': 'Number of attention heads in transformer blocks.'}
+    )
+    fastlora_transformer_ffn_size: Optional[int] = field(
+        default=None,
+        metadata={'help': 'FFN hidden size in transformer blocks. Defaults to 4 * hidden_size.'}
+    )
+    fastlora_transformer_dropout: Optional[float] = field(
+        default=0.1,
+        metadata={'help': 'Dropout rate in transformer blocks.'}
     )
 
     max_new_tokens: Optional[int] = field(
@@ -453,7 +527,7 @@ class TrainingArgs(TrainingArguments):
         metadata={'help': 'How many tokens at maximum for each input in evaluation.'},
     )
     eval_min_length: int = field(
-        default=512,
+        default=0,
         metadata={'help': 'How many tokens at minimum for each input in evaluation.'},
     )
     eval_ultragist_ratio: List[int] = field(
