@@ -49,7 +49,10 @@ def main():
     #             param.requires_grad_(False)
     
     for name, param in model.named_parameters():
-        if "fastlora" not in name:
+        # Enable gradients for fastlora parameters and transformer blocks
+        if "fastlora" in name or "transformer_hidden_state_refiner" in name:
+            param.requires_grad_(True)
+        else:
             param.requires_grad_(False)
 
     # if training_args.lora_tune:
